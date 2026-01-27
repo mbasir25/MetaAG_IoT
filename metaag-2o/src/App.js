@@ -1,18 +1,23 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { GoogleMap, LoadScript, Marker, Polygon } from "@react-google-maps/api";
+
 import polygons from "./data/polygons.json";
 import { checkInsidePolygon } from "./geo/geo";
-import { saveVisit, getUnsentVisits } from "./storage";
 import Chatbot from "./components/Chatbot";
-import EnterpriseChatbotRAG from "./components/EnterpriseChatbotRAG";
 import FieldMap from "./components/FieldMap";
 
+// ✅ Enterprise chatbot (existing repo file)
+import EnterpriseChatbotRAG from "./components/EnterpriseChatbotRAG";
+
+import { haversineMeters } from "./utils/haversine";
+import { registerEnterpriseUserLocal, loginEnterpriseUserLocal } from "./services/localEnterpriseAuth";
 import {
-  saveEnterpriseVisit,
-  getEnterpriseVisits,
-  registerEnterpriseUser,
-  loginEnterpriseUser
-} from "./enterpriseStorage";
+  connectNats,
+  disconnectNats,
+  getNatsEnvConfig,
+  publishJson,
+  subscribeJson
+} from "./services/natsService";
 
 const containerStyle = { width: "100vw", height: "100vh" };
 const defaultCenter = { lat: 40.421, lng: -86.916 };
@@ -20,20 +25,24 @@ const defaultCenter = { lat: 40.421, lng: -86.916 };
 const LS_USER_ID = "enterprise_userId";
 const LS_USER_NAME = "enterprise_userName";
 
-/** ---- NEW: visit sessionization knobs ---- */
-const EXIT_GRACE_MS = 30_000;      // must stay outside for 30s to count as a real exit
-const MIN_VISIT_SECONDS = 20;      // ignore visits shorter than 20s (jitter fragments)
-/** ---------------------------------------- */
+// Visit sessionization knobs
+const EXIT_GRACE_MS = 30_000; // must stay outside for 30s to count as a real exit
+const MIN_VISIT_SECONDS = 20; // ignore visits shorter than 20s (jitter fragments)
+
+// Matching knobs (phone ↔ machine)
+const MACHINE_RECENT_MS = 30_000; // only consider machines that sent a point in the last 30s
+const MACHINE_MAX_DISTANCE_M = 500; // optional safety: phone must be within 500m of machine
+
+// NATS message format (minimum)
+// { vehicle: "Truck-12", ts: "2026-01-27T16:10:00.000Z", lat: 40.42, lng: -86.91 }
 
 function App() {
-  const [position, setPosition] = useState(null);
-  const [currentPolygon, setCurrentPolygon] = useState(null);
-  const [entryTime, setEntryTime] = useState(null);
-  const [exitTime, setExitTime] = useState(null);
   const [mode, setMode] = useState("enterprise"); // or "personal"
 
+  // --- auth ---
   const [userId, setUserId] = useState(() => localStorage.getItem(LS_USER_ID) || "");
   const [userName, setUserName] = useState(() => localStorage.getItem(LS_USER_NAME) || "");
+  const isEnterpriseAuthed = mode !== "enterprise" ? true : !!(userId && userName);
 
   const [authTab, setAuthTab] = useState("login");
   const [authName, setAuthName] = useState("");
@@ -41,20 +50,94 @@ function App() {
   const [authError, setAuthError] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
 
-  const isEnterpriseAuthed = mode !== "enterprise" ? true : !!(userId && userName);
+  // --- phone gps UI ---
+  const [position, setPosition] = useState(null);
+  const [currentPolygon, setCurrentPolygon] = useState(null);
+  const [entryTime, setEntryTime] = useState(null);
+  const [exitTime, setExitTime] = useState(null);
 
-  /** ---- NEW: refs to manage exit debounce ---- */
-  const exitTimerRef = useRef(null);
-  const pendingExitAtRef = useRef(null);
-  /** ------------------------------------------ */
+  // --- NATS / machine gps ---
+  const [natsStatus, setNatsStatus] = useState("disconnected"); // disconnected | connecting | connected | error
+  const [natsError, setNatsError] = useState("");
+  const [machinesSeen, setMachinesSeen] = useState([]); // array of vehicle names
 
-  const clearExitTimer = () => {
-    if (exitTimerRef.current) clearTimeout(exitTimerRef.current);
-    exitTimerRef.current = null;
-    pendingExitAtRef.current = null;
+  // --- pairing ---
+  const [pairPrompt, setPairPrompt] = useState(null);
+  // pairPrompt: { field, candidates: [{vehicle, distanceM}], selectedVehicle }
+  const [activePair, setActivePair] = useState(null);
+  // activePair: { person, vehicle, field, confirmedAt }
+
+  // --- records (built locally, published to NATS on Send) ---
+  const [pendingRecords, setPendingRecords] = useState([]); // unsent
+  const [lastSendInfo, setLastSendInfo] = useState("");
+
+  // Refs to avoid stale closures inside timers
+  const userNameRef = useRef(userName);
+  const activePairRef = useRef(activePair);
+  const pairPromptRef = useRef(pairPrompt);
+  useEffect(() => {
+    userNameRef.current = userName;
+  }, [userName]);
+  useEffect(() => {
+    activePairRef.current = activePair;
+  }, [activePair]);
+  useEffect(() => {
+    pairPromptRef.current = pairPrompt;
+  }, [pairPrompt]);
+
+  // Session refs
+  const phoneSessionRef = useRef({
+    currentPolygon: null,
+    entryTime: null,
+    exitTimerId: null,
+    lastPoint: null
+  });
+
+  // machineSessionsRef.current[vehicle] = { currentPolygon, entryTime, exitTimerId, lastPoint, lastTsMs }
+  const machineSessionsRef = useRef({});
+
+  // completed machine visits (for overlap lookup)
+  const machineCompletedRef = useRef([]); // { vehicle, field, entryTime, exitTime }
+
+  const nowIso = () => new Date().toISOString();
+
+  const shouldTrackPhone = useMemo(() => {
+    if (mode === "personal") return true;
+    return isEnterpriseAuthed;
+  }, [mode, isEnterpriseAuthed]);
+
+  const shouldUseNatsMachines = useMemo(() => {
+    return mode === "enterprise" && isEnterpriseAuthed;
+  }, [mode, isEnterpriseAuthed]);
+
+  const clearSessionExitTimer = (session) => {
+    if (!session) return;
+    if (session.exitTimerId) {
+      clearTimeout(session.exitTimerId);
+      session.exitTimerId = null;
+    }
   };
 
-  const handleLogout = () => {
+  const resetAllRuntimeState = () => {
+    // Phone
+    clearSessionExitTimer(phoneSessionRef.current);
+    phoneSessionRef.current = { currentPolygon: null, entryTime: null, exitTimerId: null, lastPoint: null };
+    setCurrentPolygon(null);
+    setEntryTime(null);
+    setExitTime(null);
+
+    // Machines
+    Object.values(machineSessionsRef.current || {}).forEach(clearSessionExitTimer);
+    machineSessionsRef.current = {};
+    machineCompletedRef.current = [];
+    setMachinesSeen([]);
+
+    // Pairing
+    setPairPrompt(null);
+    setActivePair(null);
+  };
+
+  const handleLogout = async () => {
     localStorage.removeItem(LS_USER_ID);
     localStorage.removeItem(LS_USER_NAME);
     setUserId("");
@@ -63,17 +146,22 @@ function App() {
     setAuthPasskey("");
     setAuthError("");
     setAuthTab("login");
+
+    resetAllRuntimeState();
+
+    try {
+      await disconnectNats();
+    } finally {
+      setNatsStatus("disconnected");
+      setNatsError("");
+    }
   };
 
   const handleRegister = async () => {
     setAuthError("");
     setAuthBusy(true);
     try {
-      const res = await registerEnterpriseUser(authName, authPasskey);
-      if (!res?.userId) {
-        setAuthError("Registration failed. Please try again.");
-        return;
-      }
+      const res = await registerEnterpriseUserLocal(authName, authPasskey);
       localStorage.setItem(LS_USER_ID, res.userId);
       localStorage.setItem(LS_USER_NAME, res.name);
       setUserId(res.userId);
@@ -82,7 +170,7 @@ function App() {
       setAuthPasskey("");
     } catch (e) {
       console.error(e);
-      setAuthError("Registration failed. Please try again.");
+      setAuthError(e?.message || "Registration failed.");
     } finally {
       setAuthBusy(false);
     }
@@ -92,7 +180,7 @@ function App() {
     setAuthError("");
     setAuthBusy(true);
     try {
-      const res = await loginEnterpriseUser(authName, authPasskey);
+      const res = await loginEnterpriseUserLocal(authName, authPasskey);
       if (!res) {
         setAuthError("Login failed. Name/passkey not found or incorrect.");
         return;
@@ -105,88 +193,241 @@ function App() {
       setAuthPasskey("");
     } catch (e) {
       console.error(e);
-      setAuthError("Login failed. Please try again.");
+      setAuthError(e?.message || "Login failed.");
     } finally {
       setAuthBusy(false);
     }
   };
 
-  // -------- background tracking (FIXED: debounce exit + minimum duration) --------
+  // --- Pairing logic ---
+  const maybeNotify = (title, body) => {
+    if (typeof window === "undefined") return;
+    if (!("Notification" in window)) return;
+    try {
+      if (Notification.permission === "default") {
+        Notification.requestPermission().catch(() => {});
+      }
+      if (Notification.permission === "granted") {
+        new Notification(title, { body });
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const computePairCandidates = (fieldName, phonePoint) => {
+    const sessions = machineSessionsRef.current || {};
+    const nowMs = Date.now();
+    const candidates = [];
+
+    for (const [vehicle, sess] of Object.entries(sessions)) {
+      if (!sess?.currentPolygon || sess.currentPolygon !== fieldName) continue;
+      if (!sess.lastTsMs || nowMs - sess.lastTsMs > MACHINE_RECENT_MS) continue;
+
+      const dist = phonePoint && sess.lastPoint ? haversineMeters(phonePoint, sess.lastPoint) : Infinity;
+      if (isFinite(dist) && dist > MACHINE_MAX_DISTANCE_M) continue;
+
+      candidates.push({ vehicle, distanceM: dist });
+    }
+
+    candidates.sort((a, b) => (a.distanceM ?? Infinity) - (b.distanceM ?? Infinity));
+    return candidates;
+  };
+
+  const maybePromptPairing = (fieldName, phonePoint) => {
+    if (!fieldName) return;
+
+    // already paired for this field
+    const ap = activePairRef.current;
+    if (ap && ap.field === fieldName) return;
+
+    // avoid spamming if prompt already visible
+    if (pairPromptRef.current?.field === fieldName) return;
+
+    const candidates = computePairCandidates(fieldName, phonePoint);
+    if (!candidates.length) return;
+
+    const first = candidates[0]?.vehicle;
+    setPairPrompt({
+      field: fieldName,
+      candidates,
+      selectedVehicle: first || ""
+    });
+
+    if (first) {
+      maybeNotify("MetaAg", `Confirm you're with ${first} in ${fieldName}`);
+    }
+  };
+
+  const confirmPairing = () => {
+    if (!pairPrompt?.selectedVehicle || !pairPrompt?.field) {
+      setPairPrompt(null);
+      return;
+    }
+
+    const next = {
+      person: userNameRef.current || "",
+      vehicle: pairPrompt.selectedVehicle,
+      field: pairPrompt.field,
+      confirmedAt: nowIso()
+    };
+    setActivePair(next);
+    setPairPrompt(null);
+  };
+
+  const clearPairing = () => {
+    setActivePair(null);
+    setPairPrompt(null);
+  };
+
+  // --- Visit sessionization (shared for phone and machine) ---
+  const sessionizePoint = ({ session, matchedPolygon, onEnter, onComplete }) => {
+    // CASE 1: inside a polygon
+    if (matchedPolygon) {
+      // Cancel pending exit if we re-entered
+      if (session.currentPolygon && session.exitTimerId) {
+        clearSessionExitTimer(session);
+      }
+
+      // Enter new polygon
+      if (matchedPolygon !== session.currentPolygon) {
+        clearSessionExitTimer(session);
+        session.currentPolygon = matchedPolygon;
+        session.entryTime = nowIso();
+        onEnter?.(matchedPolygon, session.entryTime);
+      }
+
+      return;
+    }
+
+    // CASE 2: not inside any polygon
+    if (!matchedPolygon && session.currentPolygon) {
+      if (!session.exitTimerId) {
+        const polygonAtExitStart = session.currentPolygon;
+        const entryAt = session.entryTime;
+
+        session.exitTimerId = setTimeout(() => {
+          const finalExit = nowIso();
+          const durSeconds = entryAt ? (new Date(finalExit) - new Date(entryAt)) / 1000 : 0;
+
+          if (durSeconds >= MIN_VISIT_SECONDS) {
+            onComplete?.({
+              polygon: polygonAtExitStart,
+              entryTime: entryAt,
+              exitTime: finalExit
+            });
+          }
+
+          // finalize leaving
+          session.currentPolygon = null;
+          session.entryTime = null;
+          clearSessionExitTimer(session);
+        }, EXIT_GRACE_MS);
+      }
+    }
+  };
+
+  // --- Phone GPS tracking ---
   useEffect(() => {
+    if (!shouldTrackPhone) return;
+    resetAllRuntimeState();
+
     const watchId = navigator.geolocation.watchPosition(
       (pos) => {
         const lat = pos.coords.latitude;
         const lng = pos.coords.longitude;
         setPosition({ lat, lng });
 
+        const phonePoint = { lat, lng };
         const matched = checkInsidePolygon([lng, lat], polygons);
 
-        // CASE 1: we are inside a polygon
-        if (matched) {
-          // If we were in exit grace (GPS briefly outside), cancel the pending exit
-          if (currentPolygon && exitTimerRef.current) {
-            clearExitTimer();
-          }
+        const session = phoneSessionRef.current;
+        const prevPoly = session.currentPolygon;
+        session.lastPoint = { lat, lng };
 
-          // Enter a new polygon (or first time)
-          if (matched !== currentPolygon) {
-            clearExitTimer(); // safety
-            setCurrentPolygon(matched);
-            const now = new Date().toISOString();
-            setEntryTime(now);
+        sessionizePoint({
+          session,
+          matchedPolygon: matched,
+          onEnter: (poly, entryIso) => {
+            setCurrentPolygon(poly);
+            setEntryTime(entryIso);
             setExitTime(null);
-          }
 
-          return;
-        }
+            // When phone enters a field, look for machine(s) in the same field
+            maybePromptPairing(poly, phonePoint);
+          },
+          onComplete: (visit) => {
+            // update UI
+            setExitTime(visit.exitTime);
+            setCurrentPolygon(null);
 
-        // CASE 2: not inside any polygon
-        if (!matched && currentPolygon) {
-          // Start exit grace timer only once
-          if (!exitTimerRef.current) {
-            const exitStartedAt = new Date().toISOString();
-            pendingExitAtRef.current = exitStartedAt;
+            // Build a record and add to pending list (to be published on Send)
+            const ap = activePairRef.current;
+            const pairedVehicle = ap && ap.field === visit.polygon ? ap.vehicle : null;
 
-            exitTimerRef.current = setTimeout(() => {
-              const finalExit = new Date().toISOString();
+            // Find a machine visit that overlaps phone visit (best-effort)
+            let machineVisit = null;
+            if (pairedVehicle) {
+              const phoneStart = new Date(visit.entryTime).getTime();
+              const phoneEnd = new Date(visit.exitTime).getTime();
 
-              // compute duration safely using the latest known entryTime
-              const entry = entryTime;
-              const durSeconds = entry ? (new Date(finalExit) - new Date(entry)) / 1000 : 0;
+              const overlaps = machineCompletedRef.current
+                .filter((mv) => mv.vehicle === pairedVehicle && mv.field === visit.polygon)
+                .filter((mv) => {
+                  const ms = new Date(mv.entryTime).getTime();
+                  const me = new Date(mv.exitTime).getTime();
+                  return ms <= phoneEnd && me >= phoneStart;
+                });
 
-              // Filter fragmented exits / micro-visits
-              if (durSeconds >= MIN_VISIT_SECONDS) {
-                const visit = {
-                  polygon: currentPolygon,
-                  entryTime: entry,
-                  exitTime: finalExit
-                };
-
-                if (mode === "enterprise") {
-                  if (userId) {
-                    console.log("📦 Saving visit to Firebase (enterprise user):", userId, visit);
-                    saveEnterpriseVisit(userId, visit);
-                  } else {
-                    console.log("ℹ️ Enterprise mode active but not logged in yet; visit not saved.");
-                  }
-                } else {
-                  console.log("📦 Saving visit to Airtable/localStorage:", visit);
-                  saveVisit(visit);
-                }
-
-                setExitTime(finalExit);
+              if (overlaps.length) {
+                overlaps.sort((a, b) => {
+                  const aO =
+                    Math.min(phoneEnd, new Date(a.exitTime).getTime()) -
+                    Math.max(phoneStart, new Date(a.entryTime).getTime());
+                  const bO =
+                    Math.min(phoneEnd, new Date(b.exitTime).getTime()) -
+                    Math.max(phoneStart, new Date(b.entryTime).getTime());
+                  return bO - aO;
+                });
+                machineVisit = overlaps[0];
               } else {
-                console.log(
-                  "🗑️ Ignoring fragmented visit:",
-                  { polygon: currentPolygon, durSeconds, entry, exit: finalExit }
-                );
+                const msess = machineSessionsRef.current?.[pairedVehicle];
+                if (msess && msess.currentPolygon === visit.polygon && msess.entryTime) {
+                  machineVisit = {
+                    vehicle: pairedVehicle,
+                    field: visit.polygon,
+                    entryTime: msess.entryTime,
+                    exitTime: null
+                  };
+                }
               }
+            }
 
-              // finalize leaving state
-              setCurrentPolygon(null);
-              clearExitTimer();
-            }, EXIT_GRACE_MS);
+            const record = {
+              id: `rec_${Date.now()}_${Math.random().toString(16).slice(2)}`,
+              person: userNameRef.current || "",
+              field: visit.polygon,
+              vehicle: pairedVehicle,
+              phone: {
+                entryTime: visit.entryTime,
+                exitTime: visit.exitTime
+              },
+              machine: machineVisit
+                ? {
+                    entryTime: machineVisit.entryTime,
+                    exitTime: machineVisit.exitTime
+                  }
+                : null,
+              createdAt: nowIso()
+            };
+
+            setPendingRecords((prev) => [record, ...prev]);
           }
+        });
+
+        // If phone stayed in same field, but machines appear later, also attempt prompt
+        if (matched && matched === prevPoly) {
+          maybePromptPairing(matched, phonePoint);
         }
       },
       (err) => console.error("Geolocation error:", err),
@@ -195,9 +436,140 @@ function App() {
 
     return () => {
       navigator.geolocation.clearWatch(watchId);
-      clearExitTimer();
+      clearSessionExitTimer(phoneSessionRef.current);
     };
-  }, [currentPolygon, mode, entryTime, userId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shouldTrackPhone]);
+
+  // --- NATS machine subscription (starts after login) ---
+  useEffect(() => {
+    let unsubscribe = null;
+
+    const run = async () => {
+      if (!shouldUseNatsMachines) return;
+
+      const cfg = getNatsEnvConfig();
+      setNatsError("");
+      setNatsStatus("connecting");
+
+      try {
+        await connectNats({ url: cfg.url, token: cfg.token, name: `metaag-2o-ui:${userId || "anon"}` });
+        setNatsStatus("connected");
+
+        unsubscribe = await subscribeJson({
+          subject: cfg.gpsSubject,
+          onMessage: (msg) => {
+            const vehicle = String(msg?.vehicle || msg?.machine || msg?.vehicleName || msg?.name || "").trim();
+            const lat = Number(msg?.lat ?? msg?.latitude);
+            const lng = Number(msg?.lng ?? msg?.lon ?? msg?.longitude);
+            const ts = msg?.ts || msg?.timestamp || null;
+
+            if (!vehicle || !isFinite(lat) || !isFinite(lng)) return;
+
+            setMachinesSeen((prev) => (prev.includes(vehicle) ? prev : [...prev, vehicle].sort()));
+
+            const matched = checkInsidePolygon([lng, lat], polygons);
+            const sMap = machineSessionsRef.current;
+            const session = sMap[vehicle] || {
+              currentPolygon: null,
+              entryTime: null,
+              exitTimerId: null,
+              lastPoint: null,
+              lastTsMs: null
+            };
+
+            session.lastPoint = { lat, lng };
+            session.lastTsMs = ts ? new Date(ts).getTime() : Date.now();
+
+            sMap[vehicle] = session;
+
+            sessionizePoint({
+              session,
+              matchedPolygon: matched,
+              onEnter: (poly) => {
+                const phonePoly = phoneSessionRef.current?.currentPolygon;
+                if (phonePoly && phonePoly === poly && phoneSessionRef.current?.lastPoint) {
+                  maybePromptPairing(poly, phoneSessionRef.current.lastPoint);
+                }
+              },
+              onComplete: (visit) => {
+                machineCompletedRef.current.push({
+                  vehicle,
+                  field: visit.polygon,
+                  entryTime: visit.entryTime,
+                  exitTime: visit.exitTime
+                });
+              }
+            });
+          }
+        });
+      } catch (e) {
+        console.error(e);
+        setNatsStatus("error");
+        setNatsError(e?.message || "Failed to connect/subscribe to NATS");
+      }
+    };
+
+    run();
+
+    return () => {
+      try {
+        unsubscribe?.();
+      } catch {
+        // ignore
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shouldUseNatsMachines, userId]);
+
+  // Disconnect NATS if enterprise mode or auth goes away
+  useEffect(() => {
+    if (shouldUseNatsMachines) return;
+    (async () => {
+      try {
+        await disconnectNats();
+      } finally {
+        setNatsStatus("disconnected");
+        setNatsError("");
+      }
+    })();
+  }, [shouldUseNatsMachines]);
+
+  const handleSendRecords = async () => {
+    const cfg = getNatsEnvConfig();
+    if (!cfg.recordsPublishSubject) {
+      alert("Missing REACT_APP_NATS_RECORDS_PUB_SUBJECT");
+      return;
+    }
+    if (!pendingRecords.length) {
+      alert("No pending records to send.");
+      return;
+    }
+
+    try {
+      if (natsStatus !== "connected") {
+        setNatsStatus("connecting");
+        await connectNats({ url: cfg.url, token: cfg.token, name: `metaag-2o-ui:${userId || "anon"}` });
+        setNatsStatus("connected");
+      }
+
+      const payload = {
+        sentAt: nowIso(),
+        source: "metaag-2o-ui",
+        person: userNameRef.current || "",
+        records: pendingRecords
+      };
+
+      await publishJson({ subject: cfg.recordsPublishSubject, data: payload });
+      setLastSendInfo(`Sent ${pendingRecords.length} record(s) at ${new Date().toLocaleTimeString()}`);
+      setPendingRecords([]);
+    } catch (e) {
+      console.error(e);
+      setNatsStatus("error");
+      setNatsError(e?.message || "Failed to publish records");
+      alert(`Failed to send: ${e?.message || e}`);
+    }
+  };
 
   // Convert GeoJSON polygon to Google Maps format
   const polygonPaths = polygons.features.map((feature) =>
@@ -224,7 +596,7 @@ function App() {
         {position && <Marker position={position} />}
       </GoogleMap>
 
-      {/* top-right overlay (unchanged) */}
+      {/* top-right overlay */}
       <div
         style={{
           position: "absolute",
@@ -235,12 +607,13 @@ function App() {
           borderRadius: "8px",
           boxShadow: "0 2px 8px rgba(0,0,0,0.2)",
           zIndex: 1000,
-          maxWidth: "320px"
+          maxWidth: "360px",
+          width: "360px"
         }}
       >
         <h3 style={{ marginTop: 0 }}>MetaAg 2o</h3>
 
-        <div style={{ marginBottom: "1rem" }}>
+        <div style={{ marginBottom: "0.75rem" }}>
           <label>
             Mode:{" "}
             <select value={mode} onChange={(e) => setMode(e.target.value)}>
@@ -257,10 +630,45 @@ function App() {
                 <div>
                   <strong>User:</strong> {userName}
                 </div>
+                <div style={{ marginTop: 6 }}>
+                  <strong>NATS:</strong> {natsStatus}
+                  {natsError ? <div style={{ color: "#b00020" }}>{natsError}</div> : null}
+                </div>
+                <div style={{ marginTop: 6 }}>
+                  <strong>Machines seen:</strong> {machinesSeen.length}
+                </div>
+                {machinesSeen.length ? (
+                  <div style={{ marginTop: 6, maxHeight: 80, overflow: "auto", fontSize: 12 }}>
+                    {machinesSeen.join(", ")}
+                  </div>
+                ) : null}
+
+                {activePair ? (
+                  <div style={{ marginTop: 10, padding: 8, border: "1px solid #ddd", borderRadius: 6 }}>
+                    <div>
+                      <strong>Paired:</strong> {activePair.vehicle}
+                    </div>
+                    <div>
+                      <strong>Field:</strong> {activePair.field}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={clearPairing}
+                      style={{ marginTop: 6, width: "100%" }}
+                    >
+                      Change / Clear pairing
+                    </button>
+                  </div>
+                ) : (
+                  <div style={{ marginTop: 10, fontSize: 12, color: "#555" }}>
+                    Pairing will be requested when your phone and a machine are in the same field.
+                  </div>
+                )}
+
                 <button
                   type="button"
                   onClick={handleLogout}
-                  style={{ marginTop: "0.5rem", width: "100%" }}
+                  style={{ marginTop: "0.75rem", width: "100%" }}
                 >
                   Logout
                 </button>
@@ -270,7 +678,10 @@ function App() {
                 <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.5rem" }}>
                   <button
                     type="button"
-                    onClick={() => { setAuthTab("login"); setAuthError(""); }}
+                    onClick={() => {
+                      setAuthTab("login");
+                      setAuthError("");
+                    }}
                     style={{
                       flex: 1,
                       background: authTab === "login" ? "#007bff" : "#e9ecef",
@@ -285,7 +696,10 @@ function App() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => { setAuthTab("register"); setAuthError(""); }}
+                    onClick={() => {
+                      setAuthTab("register");
+                      setAuthError("");
+                    }}
                     style={{
                       flex: 1,
                       background: authTab === "register" ? "#007bff" : "#e9ecef",
@@ -315,52 +729,35 @@ function App() {
                   style={{ width: "100%", padding: "0.5rem", marginBottom: "0.5rem", fontSize: "16px" }}
                 />
 
-                {authError && (
-                  <div style={{ color: "#b00020", marginBottom: "0.5rem" }}>
-                    {authError}
-                  </div>
-                )}
+                {authError ? <div style={{ color: "#b00020", marginBottom: "0.5rem" }}>{authError}</div> : null}
 
                 {authTab === "login" ? (
-                  <button
-                    type="button"
-                    onClick={handleLogin}
-                    disabled={authBusy}
-                    style={{ width: "100%", fontSize: "16px" }}
-                  >
+                  <button type="button" onClick={handleLogin} disabled={authBusy} style={{ width: "100%", fontSize: "16px" }}>
                     {authBusy ? "Logging in..." : "Login"}
                   </button>
                 ) : (
-                  <button
-                    type="button"
-                    onClick={handleRegister}
-                    disabled={authBusy}
-                    style={{ width: "100%", fontSize: "16px" }}
-                  >
+                  <button type="button" onClick={handleRegister} disabled={authBusy} style={{ width: "100%", fontSize: "16px" }}>
                     {authBusy ? "Registering..." : "Register"}
                   </button>
                 )}
 
                 <div style={{ marginTop: "0.5rem", color: "#555" }}>
                   {authTab === "register"
-                    ? "Register once, then use the same name + passkey to login on this device."
-                    : "Login to start enterprise logging (visits will be saved under your name)."}
+                    ? "Registers only on this browser (localStorage)."
+                    : "Login to start tracking phone GPS + machine GPS from NATS."}
                 </div>
               </div>
             )}
           </div>
         )}
 
-        {currentPolygon && (
+        {currentPolygon ? (
           <div>
             <strong>Inside:</strong> {currentPolygon}
             <br />
-            <strong>Entry Time:</strong>{" "}
-            {entryTime ? new Date(entryTime).toLocaleTimeString() : ""}
+            <strong>Entry Time:</strong> {entryTime ? new Date(entryTime).toLocaleTimeString() : ""}
           </div>
-        )}
-
-        {!currentPolygon && exitTime && (
+        ) : exitTime ? (
           <div>
             <strong>Exited:</strong> {new Date(exitTime).toLocaleTimeString()}
             <br />
@@ -368,32 +765,99 @@ function App() {
             <br />
             {position ? `${position.lat.toFixed(5)}, ${position.lng.toFixed(5)}` : "Locating..."}
           </div>
-        )}
+        ) : null}
 
-        <div style={{ marginTop: "1rem" }}>
-          <button
-            onClick={async () => {
-              const logs =
-                mode === "enterprise"
-                  ? isEnterpriseAuthed
-                    ? await getEnterpriseVisits(userId)
-                    : []
-                  : getUnsentVisits();
-              alert(JSON.stringify(logs, null, 2));
-            }}
-          >
-            Show {mode === "enterprise" ? "Enterprise" : "Personal"} Logs
-          </button>
-        </div>
+        {mode === "enterprise" && isEnterpriseAuthed ? (
+          <div style={{ marginTop: "1rem" }}>
+            <div style={{ fontSize: 13, marginBottom: 6 }}>
+              <strong>Pending records:</strong> {pendingRecords.length}
+            </div>
+            <button type="button" onClick={handleSendRecords} style={{ width: "100%", fontSize: 16 }}>
+              Send records to NATS
+            </button>
+            {lastSendInfo ? <div style={{ marginTop: 6, fontSize: 12, color: "#555" }}>{lastSendInfo}</div> : null}
+            <button
+              type="button"
+              onClick={() => alert(JSON.stringify(pendingRecords, null, 2))}
+              style={{ width: "100%", marginTop: 6 }}
+            >
+              Preview pending records (JSON)
+            </button>
+          </div>
+        ) : null}
       </div>
 
-      {mode === "enterprise" ? (
-        isEnterpriseAuthed ? (
+      {/* Pairing prompt (in-app confirmation UI) */}
+      {pairPrompt ? (
+        <div
+          style={{
+            position: "absolute",
+            left: 10,
+            bottom: 10,
+            background: "rgba(255, 255, 255, 0.95)",
+            padding: "1rem",
+            borderRadius: "10px",
+            boxShadow: "0 2px 10px rgba(0,0,0,0.25)",
+            zIndex: 1100,
+            maxWidth: 420
+          }}
+        >
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>Confirm machine</div>
+          <div style={{ fontSize: 14, marginBottom: 10 }}>
+            Your phone is in <strong>{pairPrompt.field}</strong>. Are you with:
+          </div>
+
+          {pairPrompt.candidates.length > 1 ? (
+            <select
+              value={pairPrompt.selectedVehicle}
+              onChange={(e) => setPairPrompt((p) => ({ ...p, selectedVehicle: e.target.value }))}
+              style={{ width: "100%", padding: 8, marginBottom: 10 }}
+            >
+              {pairPrompt.candidates.map((c) => (
+                <option key={c.vehicle} value={c.vehicle}>
+                  {c.vehicle}
+                  {isFinite(c.distanceM) ? ` (≈ ${Math.round(c.distanceM)}m)` : ""}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <div style={{ marginBottom: 10 }}>
+              <strong>{pairPrompt.selectedVehicle}</strong>
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 8 }}>
+            <button type="button" onClick={confirmPairing} style={{ flex: 1, fontSize: 16 }}>
+              Yes
+            </button>
+            <button type="button" onClick={() => setPairPrompt(null)} style={{ flex: 1, fontSize: 16 }}>
+              No
+            </button>
+          </div>
+          <div style={{ fontSize: 12, color: "#555", marginTop: 8 }}>
+            Tip: If you picked the wrong machine, click “Change / Clear pairing” on the right panel.
+          </div>
+        </div>
+      ) : null}
+
+      {/* ✅ Enterprise chatbot (shows even if machinesSeen is 0) */}
+      {mode === "enterprise" && isEnterpriseAuthed ? (
+        <div
+          style={{
+            position: "absolute",
+            right: 10,
+            bottom: 10,
+            width: 420,
+            maxWidth: "92vw",
+            zIndex: 1050
+          }}
+        >
           <EnterpriseChatbotRAG userId={userId} userName={userName} />
-        ) : null
-      ) : (
-        <Chatbot apiKey={process.env.REACT_APP_OPENAI_API_KEY} />
-      )}
+        </div>
+      ) : null}
+
+      {/* Personal chatbot remains unchanged */}
+      {mode === "personal" ? <Chatbot apiKey={process.env.REACT_APP_OPENAI_API_KEY} /> : null}
     </LoadScript>
   );
 }

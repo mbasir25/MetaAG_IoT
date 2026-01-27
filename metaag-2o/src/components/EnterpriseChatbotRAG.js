@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { db } from "../firebase";
-import { ref, get, child, set } from "firebase/database";
+import { ref, get, child } from "firebase/database";
 import { getEnterpriseVisits, deleteEnterpriseVisit } from "../enterpriseStorage";
 import { logAIMetric } from "../utils/aiMetricsLogger";
 
@@ -61,7 +61,7 @@ const callLLM = async ({
 
 
 
-const EnterpriseChatbot = ({ userId, userName }) => {
+const EnterpriseChatbot = ({ userId, userName, onOperationFinalized }) => {
   const [messages, setMessages] = useState([]);
   const [userInput, setUserInput] = useState("");
 
@@ -1078,10 +1078,29 @@ Suggestions: ${item.suggestions.join(", ")}` : "";
         }
 
         if (pending.kind === "final") {
-          const newVisitRef = ref(db, `Operations/${Date.now()}`);
-          await set(newVisitRef, responses);
-          logAIMetric("FinalSave", { savedData: responses });
+          const payload = {
+            savedAt: new Date().toISOString(),
+            userId: userId || null,
+            userName: userName || null,
+            tempVisitId: tempVisitId || null,
+            operation: responses
+          };
 
+          // IMPORTANT: No Firebase writes anymore.
+          // Hand off to the parent (App.js) so it can publish to NATS / store locally.
+          try {
+            if (typeof onOperationFinalized === "function") {
+              await onOperationFinalized(payload);
+            } else {
+              console.info("[EnterpriseChatbot] Operation finalized (no handler provided):", payload);
+            }
+          } catch (e) {
+            console.error("[EnterpriseChatbot] onOperationFinalized failed:", e);
+          }
+
+          logAIMetric("FinalSave_LOCAL_ONLY", { savedData: responses });
+
+          // Remove the consumed local visit so we don't prompt again next time
           if (tempVisitId) {
             await deleteEnterpriseVisit(userId, tempVisitId);
             setTempVisitId(null);
@@ -1091,7 +1110,7 @@ Suggestions: ${item.suggestions.join(", ")}` : "";
           setPending(null);
           setPendingQueue([]);
           setStage("done");
-          setMessages((prev) => [...prev, { sender: "bot", text: "✅ Saved successfully. Thanks!" }]);
+          setMessages((prev) => [...prev, { sender: "bot", text: "✅ Recorded successfully." }]);
           return;
         }
       }
