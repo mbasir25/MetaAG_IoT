@@ -2,25 +2,33 @@
 import { connect, StringCodec } from "nats.ws";
 
 let nc = null;
+let subUnsubs = []; // track active subscriptions for cleanup
 const sc = StringCodec();
 
 export function getNatsEnvConfig() {
-  const url = process.env.REACT_APP_NATS_URL || "";
-  const gpsSubject = process.env.REACT_APP_NATS_GPS_SUBJECT || "";
-  const recordsPublishSubject = process.env.REACT_APP_NATS_RECORDS_PUB_SUBJECT || "";
+  return {
+    url: process.env.REACT_APP_NATS_URL || "",
+    gpsSubject: process.env.REACT_APP_NATS_GPS_SUBJECT || "",
+    recordsPublishSubject: process.env.REACT_APP_NATS_RECORDS_PUB_SUBJECT || "",
+    token: process.env.REACT_APP_NATS_TOKEN || "" // optional
+  };
+}
 
-  // Optional token support if you later add it:
-  const token = process.env.REACT_APP_NATS_TOKEN || "";
-
-  return { url, gpsSubject, recordsPublishSubject, token };
+export function isNatsConnected() {
+  return !!nc;
 }
 
 export async function connectNats({ url, name } = {}) {
   const cfg = getNatsEnvConfig();
-  const servers = url || cfg.url;
+  const servers = (url || cfg.url || "").trim();
 
   if (!servers) {
     throw new Error("Missing REACT_APP_NATS_URL (must be ws:// or wss:// endpoint)");
+  }
+
+  // Hard guard: people often put nats:// or the 4222 port
+  if (servers.startsWith("nats://")) {
+    throw new Error(`REACT_APP_NATS_URL must be ws:// or wss://, not nats:// (${servers})`);
   }
 
   if (nc) return nc;
@@ -30,26 +38,40 @@ export async function connectNats({ url, name } = {}) {
     name: name || "metaag-2o-ui"
   };
 
-  // If you later decide to use simple token auth:
-  if (cfg.token) {
-    opts.token = cfg.token;
+  // Optional token auth
+  if (cfg.token) opts.token = cfg.token;
+
+  try {
+    nc = await connect(opts);
+
+    // Clear nc when it closes so reconnect works
+    nc.closed()
+      .then(() => {
+        nc = null;
+      })
+      .catch(() => {
+        nc = null;
+      });
+
+    return nc;
+  } catch (e) {
+    // Make the error more readable
+    const msg = e?.message || String(e);
+    throw new Error(`NATS WS connect failed to ${servers}: ${msg}`);
   }
-
-  nc = await connect(opts);
-
-  // Clear nc on close so reconnect works
-  nc.closed()
-    .then(() => {
-      nc = null;
-    })
-    .catch(() => {
-      nc = null;
-    });
-
-  return nc;
 }
 
 export async function disconnectNats() {
+  // unsubscribe local subs
+  for (const u of subUnsubs) {
+    try {
+      u();
+    } catch {
+      // ignore
+    }
+  }
+  subUnsubs = [];
+
   if (!nc) return;
   try {
     await nc.drain();
@@ -58,37 +80,41 @@ export async function disconnectNats() {
   }
 }
 
+/**
+ * Subscribe to a subject and parse JSON messages.
+ * Returns an unsubscribe function.
+ */
 export async function subscribeJson({ subject, onMessage }) {
   const cfg = getNatsEnvConfig();
-  const subSubject = subject || cfg.gpsSubject;
+  const subSubject = (subject || cfg.gpsSubject || "").trim();
+  if (!subSubject) throw new Error("Missing subscribe subject (REACT_APP_NATS_GPS_SUBJECT)");
 
-  if (!subSubject) {
-    throw new Error("Missing subscribe subject (REACT_APP_NATS_GPS_SUBJECT)");
-  }
-
-  if (!nc) {
-    await connectNats();
-  }
+  if (!nc) await connectNats();
 
   const sub = nc.subscribe(subSubject);
   let cancelled = false;
 
   (async () => {
-    for await (const m of sub) {
-      if (cancelled) break;
+    try {
+      for await (const m of sub) {
+        if (cancelled) break;
 
-      const txt = sc.decode(m.data);
-      try {
-        const json = JSON.parse(txt);
-        onMessage?.(json, m.subject);
-      } catch {
-        // If message isn't JSON, still pass something useful for debugging:
-        onMessage?.({ _raw: txt }, m.subject);
+        const txt = sc.decode(m.data);
+        try {
+          const json = JSON.parse(txt);
+          onMessage?.(json, m.subject);
+        } catch {
+          // if not JSON, pass raw for debugging
+          onMessage?.({ _raw: txt }, m.subject);
+        }
       }
+    } catch (e) {
+      // subscription loop errors (disconnects etc.)
+      console.error("NATS subscribe loop error:", e);
     }
   })();
 
-  return () => {
+  const unsubscribe = () => {
     cancelled = true;
     try {
       sub.unsubscribe();
@@ -96,19 +122,25 @@ export async function subscribeJson({ subject, onMessage }) {
       // ignore
     }
   };
+
+  subUnsubs.push(unsubscribe);
+  return unsubscribe;
 }
 
+/**
+ * Publish a JSON payload to a subject.
+ */
 export async function publishJson({ subject, data }) {
   const cfg = getNatsEnvConfig();
-  const pubSubject = subject || cfg.recordsPublishSubject;
+  const pubSubject = (subject || cfg.recordsPublishSubject || "").trim();
+  if (!pubSubject) throw new Error("Missing publish subject (REACT_APP_NATS_RECORDS_PUB_SUBJECT)");
 
-  if (!pubSubject) {
-    throw new Error("Missing publish subject (REACT_APP_NATS_RECORDS_PUB_SUBJECT)");
+  if (!nc) await connectNats();
+
+  try {
+    nc.publish(pubSubject, sc.encode(JSON.stringify(data ?? {})));
+  } catch (e) {
+    const msg = e?.message || String(e);
+    throw new Error(`NATS publish failed (${pubSubject}): ${msg}`);
   }
-
-  if (!nc) {
-    await connectNats();
-  }
-
-  nc.publish(pubSubject, sc.encode(JSON.stringify(data ?? {})));
 }
