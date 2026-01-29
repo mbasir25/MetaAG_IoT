@@ -4,17 +4,12 @@ import { GoogleMap, LoadScript, Marker, Polygon } from "@react-google-maps/api";
 import polygons from "./data/polygons.json";
 import { checkInsidePolygon } from "./geo/geo";
 import Chatbot from "./components/Chatbot";
+import EnterpriseChatbotRAG from "./components/EnterpriseChatbotRAG";
 import FieldMap from "./components/FieldMap";
 
 import { haversineMeters } from "./utils/haversine";
 import { registerEnterpriseUserLocal, loginEnterpriseUserLocal } from "./services/localEnterpriseAuth";
-import {
-  connectNats,
-  disconnectNats,
-  getNatsEnvConfig,
-  publishJson,
-  subscribeJson
-} from "./services/natsService";
+import { connectNats, disconnectNats, getNatsEnvConfig, publishJson, subscribeJson } from "./services/natsService";
 
 const containerStyle = { width: "100vw", height: "100vh" };
 const defaultCenter = { lat: 40.421, lng: -86.916 };
@@ -30,8 +25,10 @@ const MIN_VISIT_SECONDS = 20; // ignore visits shorter than 20s (jitter fragment
 const MACHINE_RECENT_MS = 30_000; // only consider machines that sent a point in the last 30s
 const MACHINE_MAX_DISTANCE_M = 500; // optional safety: phone must be within 500m of machine
 
+const GPS_FEED_MAX = 30;
+
 function App() {
-  const [mode, setMode] = useState("enterprise"); // or "personal"
+  const [mode, setMode] = useState("enterprise"); // "enterprise" | "personal"
 
   // --- auth ---
   const [userId, setUserId] = useState(() => localStorage.getItem(LS_USER_ID) || "");
@@ -53,11 +50,10 @@ function App() {
   // --- NATS / machine gps ---
   const [natsStatus, setNatsStatus] = useState("disconnected"); // disconnected | connecting | connected | error
   const [natsError, setNatsError] = useState("");
-  const [machinesSeen, setMachinesSeen] = useState([]); // array of vehicle names
+  const [machinesSeen, setMachinesSeen] = useState([]); // unique machine names
 
-  // --- live feed of incoming machine GPS messages ---
+  // --- realtime incoming messages feed (machine GPS) ---
   const [gpsFeed, setGpsFeed] = useState([]); // newest first
-  const GPS_FEED_MAX = 30;
 
   // --- pairing ---
   const [pairPrompt, setPairPrompt] = useState(null);
@@ -71,11 +67,12 @@ function App() {
   const userNameRef = useRef(userName);
   const activePairRef = useRef(activePair);
   const pairPromptRef = useRef(pairPrompt);
+
   useEffect(() => { userNameRef.current = userName; }, [userName]);
   useEffect(() => { activePairRef.current = activePair; }, [activePair]);
   useEffect(() => { pairPromptRef.current = pairPrompt; }, [pairPrompt]);
 
-  // Session refs
+  // Phone session ref
   const phoneSessionRef = useRef({
     currentPolygon: null,
     entryTime: null,
@@ -85,8 +82,6 @@ function App() {
 
   // machineSessionsRef.current[vehicle] = { currentPolygon, entryTime, exitTimerId, lastPoint, lastTsMs }
   const machineSessionsRef = useRef({});
-
-  // completed machine visits (for overlap lookup)
   const machineCompletedRef = useRef([]); // { vehicle, field, entryTime, exitTime }
 
   const nowIso = () => new Date().toISOString();
@@ -121,8 +116,6 @@ function App() {
     machineSessionsRef.current = {};
     machineCompletedRef.current = [];
     setMachinesSeen([]);
-
-    // Live feed
     setGpsFeed([]);
 
     // Pairing
@@ -273,11 +266,11 @@ function App() {
 
   // --- Visit sessionization (shared for phone and machine) ---
   const sessionizePoint = ({ session, matchedPolygon, onEnter, onComplete }) => {
+    // inside a polygon
     if (matchedPolygon) {
       if (session.currentPolygon && session.exitTimerId) {
         clearSessionExitTimer(session);
       }
-
       if (matchedPolygon !== session.currentPolygon) {
         clearSessionExitTimer(session);
         session.currentPolygon = matchedPolygon;
@@ -287,6 +280,7 @@ function App() {
       return;
     }
 
+    // not inside any polygon
     if (!matchedPolygon && session.currentPolygon) {
       if (!session.exitTimerId) {
         const polygonAtExitStart = session.currentPolygon;
@@ -346,6 +340,7 @@ function App() {
             const ap = activePairRef.current;
             const pairedVehicle = ap && ap.field === visit.polygon ? ap.vehicle : null;
 
+            // Find machine overlap (best-effort)
             let machineVisit = null;
             if (pairedVehicle) {
               const phoneStart = new Date(visit.entryTime).getTime();
@@ -392,9 +387,7 @@ function App() {
                 entryTime: visit.entryTime,
                 exitTime: visit.exitTime
               },
-              machine: machineVisit
-                ? { entryTime: machineVisit.entryTime, exitTime: machineVisit.exitTime }
-                : null,
+              machine: machineVisit ? { entryTime: machineVisit.entryTime, exitTime: machineVisit.exitTime } : null,
               createdAt: nowIso()
             };
 
@@ -429,17 +422,17 @@ function App() {
       setNatsStatus("connecting");
 
       try {
-        await connectNats({ url: cfg.url, token: cfg.token, name: `metaag-2o-ui:${userId || "anon"}` });
+        await connectNats({ url: cfg.url, name: `metaag-2o-ui:${userId || "anon"}` });
         setNatsStatus("connected");
 
         unsubscribe = await subscribeJson({
-          subject: cfg.gpsSubject, // you’ll set this to *.gps.>
+          subject: cfg.gpsSubject, // e.g. "*.gps.>"
           onMessage: (msg) => {
-            // ✅ accept your payload:
+            // Supports your payload example:
             // {"class":"TPV","device":"fake","status":5,"mode":3,"time":"...","lat":...,"lon":...}
 
             const vehicle = String(
-              msg?.device ??       // ✅ your machine name field
+              msg?.device ?? // ✅ your machine id field
               msg?.vehicle ??
               msg?.machine ??
               msg?.vehicleName ??
@@ -450,22 +443,22 @@ function App() {
             const lat = Number(msg?.lat ?? msg?.latitude);
             const lng = Number(
               msg?.lng ??
-              msg?.lon ??          // ✅ your lon field
+              msg?.lon ?? // ✅ your longitude field
               msg?.long ??
               msg?.longitude
             );
 
             const tsRaw = msg?.time ?? msg?.ts ?? msg?.timestamp ?? null;
+            const tsIso = tsRaw ? new Date(tsRaw).toISOString() : new Date().toISOString();
 
             if (!vehicle || !isFinite(lat) || !isFinite(lng)) return;
 
-            // machine count (unique)
+            // update machines seen
             setMachinesSeen((prev) => (prev.includes(vehicle) ? prev : [...prev, vehicle].sort()));
 
             const matched = checkInsidePolygon([lng, lat], polygons);
-            const tsIso = tsRaw ? new Date(tsRaw).toISOString() : new Date().toISOString();
 
-            // ✅ Live feed update (shows inside/outside)
+            // realtime feed box
             setGpsFeed((prev) => {
               const next = [
                 {
@@ -482,7 +475,7 @@ function App() {
               return next.slice(0, GPS_FEED_MAX);
             });
 
-            // machine sessionization
+            // sessionize machine visits
             const sMap = machineSessionsRef.current;
             const session = sMap[vehicle] || {
               currentPolygon: null,
@@ -519,7 +512,7 @@ function App() {
       } catch (e) {
         console.error("NATS connect/subscribe error:", e);
         setNatsStatus("error");
-        setNatsError(String(e?.message || e)); // show actual error
+        setNatsError(String(e?.message || e)); // show real error
       }
     };
 
@@ -562,7 +555,7 @@ function App() {
     try {
       if (natsStatus !== "connected") {
         setNatsStatus("connecting");
-        await connectNats({ url: cfg.url, token: cfg.token, name: `metaag-2o-ui:${userId || "anon"}` });
+        await connectNats({ url: cfg.url, name: `metaag-2o-ui:${userId || "anon"}` });
         setNatsStatus("connected");
       }
 
@@ -589,9 +582,10 @@ function App() {
     feature.geometry.coordinates[0].map(([lng, lat]) => ({ lat, lng }))
   );
 
-  return window.location.hash === "#map" ? (
-    <FieldMap />
-  ) : (
+  // Map shortcut
+  if (window.location.hash === "#map") return <FieldMap />;
+
+  return (
     <LoadScript googleMapsApiKey={process.env.REACT_APP_GOOGLE_MAPS_API_KEY}>
       <GoogleMap mapContainerStyle={containerStyle} center={position || defaultCenter} zoom={17}>
         {polygonPaths.map((path, i) => (
@@ -644,7 +638,7 @@ function App() {
                   <strong>User:</strong> {userName}
                 </div>
 
-                {/* ✅ show the device/browser GPS */}
+                {/* ✅ show device/browser GPS */}
                 <div style={{ marginTop: 6 }}>
                   <strong>My GPS:</strong>{" "}
                   {position ? `${position.lat.toFixed(5)}, ${position.lng.toFixed(5)}` : "Locating..."}
@@ -654,16 +648,18 @@ function App() {
                   <strong>NATS:</strong> {natsStatus}
                   {natsError ? <div style={{ color: "#b00020" }}>{natsError}</div> : null}
                 </div>
+
                 <div style={{ marginTop: 6 }}>
                   <strong>Machines seen:</strong> {machinesSeen.length}
                 </div>
+
                 {machinesSeen.length ? (
                   <div style={{ marginTop: 6, maxHeight: 60, overflow: "auto", fontSize: 12 }}>
                     {machinesSeen.join(", ")}
                   </div>
                 ) : null}
 
-                {/* ✅ Live GPS feed under top-right panel */}
+                {/* ✅ realtime GPS feed */}
                 <div style={{ marginTop: 12 }}>
                   <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>
                     Live GPS messages ({gpsFeed.length})
@@ -681,24 +677,14 @@ function App() {
                     }}
                   >
                     {gpsFeed.length === 0 ? (
-                      <div style={{ color: "#666" }}>
-                        Waiting for messages…
-                      </div>
+                      <div style={{ color: "#666" }}>Waiting for messages…</div>
                     ) : (
                       gpsFeed.map((m) => (
-                        <div
-                          key={m.id}
-                          style={{
-                            padding: "6px 0",
-                            borderBottom: "1px dashed #e5e5e5"
-                          }}
-                        >
+                        <div key={m.id} style={{ padding: "6px 0", borderBottom: "1px dashed #e5e5e5" }}>
                           <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
                             <div>
                               <strong>{m.vehicle}</strong>{" "}
-                              <span style={{ color: "#666" }}>
-                                {new Date(m.ts).toLocaleTimeString()}
-                              </span>
+                              <span style={{ color: "#666" }}>{new Date(m.ts).toLocaleTimeString()}</span>
                             </div>
                             <div style={{ fontWeight: 700 }}>
                               {m.field ? (
@@ -717,9 +703,7 @@ function App() {
                             {m.raw?.mode !== undefined ? (
                               <span style={{ color: "#666" }}> • mode: {m.raw.mode}</span>
                             ) : null}
-                            {m.raw?.class ? (
-                              <span style={{ color: "#666" }}> • class: {m.raw.class}</span>
-                            ) : null}
+                            {m.raw?.class ? <span style={{ color: "#666" }}> • class: {m.raw.class}</span> : null}
                           </div>
                         </div>
                       ))
@@ -735,14 +719,7 @@ function App() {
                     <div>
                       <strong>Field:</strong> {activePair.field}
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setActivePair(null);
-                        setPairPrompt(null);
-                      }}
-                      style={{ marginTop: 6, width: "100%" }}
-                    >
+                    <button type="button" onClick={clearPairing} style={{ marginTop: 6, width: "100%" }}>
                       Change / Clear pairing
                     </button>
                   </div>
@@ -752,11 +729,7 @@ function App() {
                   </div>
                 )}
 
-                <button
-                  type="button"
-                  onClick={handleLogout}
-                  style={{ marginTop: "0.75rem", width: "100%" }}
-                >
+                <button type="button" onClick={handleLogout} style={{ marginTop: "0.75rem", width: "100%" }}>
                   Logout
                 </button>
               </div>
@@ -765,10 +738,7 @@ function App() {
                 <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.5rem" }}>
                   <button
                     type="button"
-                    onClick={() => {
-                      setAuthTab("login");
-                      setAuthError("");
-                    }}
+                    onClick={() => { setAuthTab("login"); setAuthError(""); }}
                     style={{
                       flex: 1,
                       background: authTab === "login" ? "#007bff" : "#e9ecef",
@@ -783,10 +753,7 @@ function App() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => {
-                      setAuthTab("register");
-                      setAuthError("");
-                    }}
+                    onClick={() => { setAuthTab("register"); setAuthError(""); }}
                     style={{
                       flex: 1,
                       background: authTab === "register" ? "#007bff" : "#e9ecef",
@@ -874,7 +841,7 @@ function App() {
         ) : null}
       </div>
 
-      {/* Pairing prompt */}
+      {/* Pairing prompt (in-app confirmation UI) */}
       {pairPrompt ? (
         <div
           style={{
@@ -921,14 +888,28 @@ function App() {
               No
             </button>
           </div>
+
           <div style={{ fontSize: 12, color: "#555", marginTop: 8 }}>
             Tip: If you picked the wrong machine, click “Change / Clear pairing” on the right panel.
           </div>
         </div>
       ) : null}
 
-      {/* Personal chatbot */}
+      {/* Chatbots */}
       {mode === "personal" ? <Chatbot apiKey={process.env.REACT_APP_OPENAI_API_KEY} /> : null}
+
+      {mode === "enterprise" && isEnterpriseAuthed ? (
+        <EnterpriseChatbotRAG
+          userId={userId}
+          userName={userName}
+          // If your updated EnterpriseChatbotRAG uses this callback, keep it.
+          // Otherwise it will be ignored safely.
+          onOperationFinalized={(payload) => {
+            // You can choose to merge these into pendingRecords if you want
+            console.log("Enterprise operation finalized:", payload);
+          }}
+        />
+      ) : null}
     </LoadScript>
   );
 }
