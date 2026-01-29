@@ -13,8 +13,8 @@ const RESERVED_TABLES = new Set(["eval", "visits", "operations", "template", "re
 // Leave null to allow all non-reserved tables.
 const REFERENCE_ALLOWLIST = null;
 
-const AI_LABEL = "Gemini 2.0 Flash (free, OpenRouter)";
-const OPENROUTER_MODEL = "google/gemini-2.0-flash-exp:free";
+const AI_LABEL = "(free, OpenRouter)";
+const OPENROUTER_MODEL = "liquid/lfm-2.5-1.2b-thinking:free";
 
 /**
  * OpenRouter chat completion helper (browser-safe via fetch).
