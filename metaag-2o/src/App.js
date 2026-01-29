@@ -6,9 +6,6 @@ import { checkInsidePolygon } from "./geo/geo";
 import Chatbot from "./components/Chatbot";
 import FieldMap from "./components/FieldMap";
 
-// ✅ Enterprise chatbot (existing repo file)
-import EnterpriseChatbotRAG from "./components/EnterpriseChatbotRAG";
-
 import { haversineMeters } from "./utils/haversine";
 import { registerEnterpriseUserLocal, loginEnterpriseUserLocal } from "./services/localEnterpriseAuth";
 import {
@@ -33,9 +30,6 @@ const MIN_VISIT_SECONDS = 20; // ignore visits shorter than 20s (jitter fragment
 const MACHINE_RECENT_MS = 30_000; // only consider machines that sent a point in the last 30s
 const MACHINE_MAX_DISTANCE_M = 500; // optional safety: phone must be within 500m of machine
 
-// NATS message format (minimum)
-// { vehicle: "Truck-12", ts: "2026-01-27T16:10:00.000Z", lat: 40.42, lng: -86.91 }
-
 function App() {
   const [mode, setMode] = useState("enterprise"); // or "personal"
 
@@ -50,7 +44,7 @@ function App() {
   const [authError, setAuthError] = useState("");
   const [authBusy, setAuthBusy] = useState(false);
 
-  // --- phone gps UI ---
+  // --- phone gps UI (device running the browser) ---
   const [position, setPosition] = useState(null);
   const [currentPolygon, setCurrentPolygon] = useState(null);
   const [entryTime, setEntryTime] = useState(null);
@@ -61,11 +55,13 @@ function App() {
   const [natsError, setNatsError] = useState("");
   const [machinesSeen, setMachinesSeen] = useState([]); // array of vehicle names
 
+  // --- live feed of incoming machine GPS messages ---
+  const [gpsFeed, setGpsFeed] = useState([]); // newest first
+  const GPS_FEED_MAX = 30;
+
   // --- pairing ---
   const [pairPrompt, setPairPrompt] = useState(null);
-  // pairPrompt: { field, candidates: [{vehicle, distanceM}], selectedVehicle }
   const [activePair, setActivePair] = useState(null);
-  // activePair: { person, vehicle, field, confirmedAt }
 
   // --- records (built locally, published to NATS on Send) ---
   const [pendingRecords, setPendingRecords] = useState([]); // unsent
@@ -75,15 +71,9 @@ function App() {
   const userNameRef = useRef(userName);
   const activePairRef = useRef(activePair);
   const pairPromptRef = useRef(pairPrompt);
-  useEffect(() => {
-    userNameRef.current = userName;
-  }, [userName]);
-  useEffect(() => {
-    activePairRef.current = activePair;
-  }, [activePair]);
-  useEffect(() => {
-    pairPromptRef.current = pairPrompt;
-  }, [pairPrompt]);
+  useEffect(() => { userNameRef.current = userName; }, [userName]);
+  useEffect(() => { activePairRef.current = activePair; }, [activePair]);
+  useEffect(() => { pairPromptRef.current = pairPrompt; }, [pairPrompt]);
 
   // Session refs
   const phoneSessionRef = useRef({
@@ -131,6 +121,9 @@ function App() {
     machineSessionsRef.current = {};
     machineCompletedRef.current = [];
     setMachinesSeen([]);
+
+    // Live feed
+    setGpsFeed([]);
 
     // Pairing
     setPairPrompt(null);
@@ -237,11 +230,9 @@ function App() {
   const maybePromptPairing = (fieldName, phonePoint) => {
     if (!fieldName) return;
 
-    // already paired for this field
     const ap = activePairRef.current;
     if (ap && ap.field === fieldName) return;
 
-    // avoid spamming if prompt already visible
     if (pairPromptRef.current?.field === fieldName) return;
 
     const candidates = computePairCandidates(fieldName, phonePoint);
@@ -282,25 +273,20 @@ function App() {
 
   // --- Visit sessionization (shared for phone and machine) ---
   const sessionizePoint = ({ session, matchedPolygon, onEnter, onComplete }) => {
-    // CASE 1: inside a polygon
     if (matchedPolygon) {
-      // Cancel pending exit if we re-entered
       if (session.currentPolygon && session.exitTimerId) {
         clearSessionExitTimer(session);
       }
 
-      // Enter new polygon
       if (matchedPolygon !== session.currentPolygon) {
         clearSessionExitTimer(session);
         session.currentPolygon = matchedPolygon;
         session.entryTime = nowIso();
         onEnter?.(matchedPolygon, session.entryTime);
       }
-
       return;
     }
 
-    // CASE 2: not inside any polygon
     if (!matchedPolygon && session.currentPolygon) {
       if (!session.exitTimerId) {
         const polygonAtExitStart = session.currentPolygon;
@@ -318,7 +304,6 @@ function App() {
             });
           }
 
-          // finalize leaving
           session.currentPolygon = null;
           session.entryTime = null;
           clearSessionExitTimer(session);
@@ -327,7 +312,7 @@ function App() {
     }
   };
 
-  // --- Phone GPS tracking ---
+  // --- Phone GPS tracking (device running browser) ---
   useEffect(() => {
     if (!shouldTrackPhone) return;
     resetAllRuntimeState();
@@ -352,20 +337,15 @@ function App() {
             setCurrentPolygon(poly);
             setEntryTime(entryIso);
             setExitTime(null);
-
-            // When phone enters a field, look for machine(s) in the same field
             maybePromptPairing(poly, phonePoint);
           },
           onComplete: (visit) => {
-            // update UI
             setExitTime(visit.exitTime);
             setCurrentPolygon(null);
 
-            // Build a record and add to pending list (to be published on Send)
             const ap = activePairRef.current;
             const pairedVehicle = ap && ap.field === visit.polygon ? ap.vehicle : null;
 
-            // Find a machine visit that overlaps phone visit (best-effort)
             let machineVisit = null;
             if (pairedVehicle) {
               const phoneStart = new Date(visit.entryTime).getTime();
@@ -413,10 +393,7 @@ function App() {
                 exitTime: visit.exitTime
               },
               machine: machineVisit
-                ? {
-                    entryTime: machineVisit.entryTime,
-                    exitTime: machineVisit.exitTime
-                  }
+                ? { entryTime: machineVisit.entryTime, exitTime: machineVisit.exitTime }
                 : null,
               createdAt: nowIso()
             };
@@ -425,7 +402,6 @@ function App() {
           }
         });
 
-        // If phone stayed in same field, but machines appear later, also attempt prompt
         if (matched && matched === prevPoly) {
           maybePromptPairing(matched, phonePoint);
         }
@@ -457,18 +433,56 @@ function App() {
         setNatsStatus("connected");
 
         unsubscribe = await subscribeJson({
-          subject: cfg.gpsSubject,
+          subject: cfg.gpsSubject, // you’ll set this to *.gps.>
           onMessage: (msg) => {
-            const vehicle = String(msg?.vehicle || msg?.machine || msg?.vehicleName || msg?.name || "").trim();
+            // ✅ accept your payload:
+            // {"class":"TPV","device":"fake","status":5,"mode":3,"time":"...","lat":...,"lon":...}
+
+            const vehicle = String(
+              msg?.device ??       // ✅ your machine name field
+              msg?.vehicle ??
+              msg?.machine ??
+              msg?.vehicleName ??
+              msg?.name ??
+              ""
+            ).trim();
+
             const lat = Number(msg?.lat ?? msg?.latitude);
-            const lng = Number(msg?.lng ?? msg?.lon ?? msg?.longitude);
-            const ts = msg?.ts || msg?.timestamp || null;
+            const lng = Number(
+              msg?.lng ??
+              msg?.lon ??          // ✅ your lon field
+              msg?.long ??
+              msg?.longitude
+            );
+
+            const tsRaw = msg?.time ?? msg?.ts ?? msg?.timestamp ?? null;
 
             if (!vehicle || !isFinite(lat) || !isFinite(lng)) return;
 
+            // machine count (unique)
             setMachinesSeen((prev) => (prev.includes(vehicle) ? prev : [...prev, vehicle].sort()));
 
             const matched = checkInsidePolygon([lng, lat], polygons);
+            const tsIso = tsRaw ? new Date(tsRaw).toISOString() : new Date().toISOString();
+
+            // ✅ Live feed update (shows inside/outside)
+            setGpsFeed((prev) => {
+              const next = [
+                {
+                  id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+                  vehicle,
+                  ts: tsIso,
+                  lat,
+                  lng,
+                  field: matched || null,
+                  raw: msg
+                },
+                ...prev
+              ];
+              return next.slice(0, GPS_FEED_MAX);
+            });
+
+            // machine sessionization
             const sMap = machineSessionsRef.current;
             const session = sMap[vehicle] || {
               currentPolygon: null,
@@ -479,8 +493,7 @@ function App() {
             };
 
             session.lastPoint = { lat, lng };
-            session.lastTsMs = ts ? new Date(ts).getTime() : Date.now();
-
+            session.lastTsMs = tsRaw ? new Date(tsRaw).getTime() : Date.now();
             sMap[vehicle] = session;
 
             sessionizePoint({
@@ -504,9 +517,9 @@ function App() {
           }
         });
       } catch (e) {
-        console.error(e);
+        console.error("NATS connect/subscribe error:", e);
         setNatsStatus("error");
-        setNatsError(e?.message || "Failed to connect/subscribe to NATS");
+        setNatsError(String(e?.message || e)); // show actual error
       }
     };
 
@@ -566,7 +579,7 @@ function App() {
     } catch (e) {
       console.error(e);
       setNatsStatus("error");
-      setNatsError(e?.message || "Failed to publish records");
+      setNatsError(String(e?.message || e));
       alert(`Failed to send: ${e?.message || e}`);
     }
   };
@@ -630,6 +643,13 @@ function App() {
                 <div>
                   <strong>User:</strong> {userName}
                 </div>
+
+                {/* ✅ show the device/browser GPS */}
+                <div style={{ marginTop: 6 }}>
+                  <strong>My GPS:</strong>{" "}
+                  {position ? `${position.lat.toFixed(5)}, ${position.lng.toFixed(5)}` : "Locating..."}
+                </div>
+
                 <div style={{ marginTop: 6 }}>
                   <strong>NATS:</strong> {natsStatus}
                   {natsError ? <div style={{ color: "#b00020" }}>{natsError}</div> : null}
@@ -638,10 +658,74 @@ function App() {
                   <strong>Machines seen:</strong> {machinesSeen.length}
                 </div>
                 {machinesSeen.length ? (
-                  <div style={{ marginTop: 6, maxHeight: 80, overflow: "auto", fontSize: 12 }}>
+                  <div style={{ marginTop: 6, maxHeight: 60, overflow: "auto", fontSize: 12 }}>
                     {machinesSeen.join(", ")}
                   </div>
                 ) : null}
+
+                {/* ✅ Live GPS feed under top-right panel */}
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>
+                    Live GPS messages ({gpsFeed.length})
+                  </div>
+
+                  <div
+                    style={{
+                      border: "1px solid #ddd",
+                      borderRadius: 8,
+                      padding: 8,
+                      maxHeight: 180,
+                      overflow: "auto",
+                      background: "rgba(255,255,255,0.7)",
+                      fontSize: 12
+                    }}
+                  >
+                    {gpsFeed.length === 0 ? (
+                      <div style={{ color: "#666" }}>
+                        Waiting for messages…
+                      </div>
+                    ) : (
+                      gpsFeed.map((m) => (
+                        <div
+                          key={m.id}
+                          style={{
+                            padding: "6px 0",
+                            borderBottom: "1px dashed #e5e5e5"
+                          }}
+                        >
+                          <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                            <div>
+                              <strong>{m.vehicle}</strong>{" "}
+                              <span style={{ color: "#666" }}>
+                                {new Date(m.ts).toLocaleTimeString()}
+                              </span>
+                            </div>
+                            <div style={{ fontWeight: 700 }}>
+                              {m.field ? (
+                                <span style={{ color: "#0a7" }}>IN: {m.field}</span>
+                              ) : (
+                                <span style={{ color: "#b00" }}>OUTSIDE</span>
+                              )}
+                            </div>
+                          </div>
+
+                          <div style={{ color: "#444", marginTop: 2 }}>
+                            {m.lat.toFixed(5)}, {m.lng.toFixed(5)}
+                            {m.raw?.status !== undefined ? (
+                              <span style={{ color: "#666" }}> • status: {m.raw.status}</span>
+                            ) : null}
+                            {m.raw?.mode !== undefined ? (
+                              <span style={{ color: "#666" }}> • mode: {m.raw.mode}</span>
+                            ) : null}
+                            {m.raw?.class ? (
+                              <span style={{ color: "#666" }}> • class: {m.raw.class}</span>
+                            ) : null}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
 
                 {activePair ? (
                   <div style={{ marginTop: 10, padding: 8, border: "1px solid #ddd", borderRadius: 6 }}>
@@ -653,7 +737,10 @@ function App() {
                     </div>
                     <button
                       type="button"
-                      onClick={clearPairing}
+                      onClick={() => {
+                        setActivePair(null);
+                        setPairPrompt(null);
+                      }}
                       style={{ marginTop: 6, width: "100%" }}
                     >
                       Change / Clear pairing
@@ -787,7 +874,7 @@ function App() {
         ) : null}
       </div>
 
-      {/* Pairing prompt (in-app confirmation UI) */}
+      {/* Pairing prompt */}
       {pairPrompt ? (
         <div
           style={{
@@ -840,23 +927,7 @@ function App() {
         </div>
       ) : null}
 
-      {/* ✅ Enterprise chatbot (shows even if machinesSeen is 0) */}
-      {mode === "enterprise" && isEnterpriseAuthed ? (
-        <div
-          style={{
-            position: "absolute",
-            right: 10,
-            bottom: 10,
-            width: 420,
-            maxWidth: "92vw",
-            zIndex: 1050
-          }}
-        >
-          <EnterpriseChatbotRAG userId={userId} userName={userName} />
-        </div>
-      ) : null}
-
-      {/* Personal chatbot remains unchanged */}
+      {/* Personal chatbot */}
       {mode === "personal" ? <Chatbot apiKey={process.env.REACT_APP_OPENAI_API_KEY} /> : null}
     </LoadScript>
   );
