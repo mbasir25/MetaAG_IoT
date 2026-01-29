@@ -27,6 +27,9 @@ const MACHINE_MAX_DISTANCE_M = 500; // optional safety: phone must be within 500
 
 const GPS_FEED_MAX = 30;
 
+// ✅ hard requirement from you:
+const FORCE_GPS_SUBJECT = "*.gps.>";
+
 function App() {
   const [mode, setMode] = useState("enterprise"); // "enterprise" | "personal"
 
@@ -63,14 +66,28 @@ function App() {
   const [pendingRecords, setPendingRecords] = useState([]); // unsent
   const [lastSendInfo, setLastSendInfo] = useState("");
 
+  // ✅ DEBUG/DIAGNOSTICS (proves subscription + message receipt)
+  const [natsSubStatus, setNatsSubStatus] = useState("not_started"); // not_started|subscribing|subscribed|failed|unsubscribed
+  const [natsMsgCount, setNatsMsgCount] = useState(0);
+  const [natsLastSubject, setNatsLastSubject] = useState("");
+  const [natsLastMsgAt, setNatsLastMsgAt] = useState("");
+  const [natsLastMsgPreview, setNatsLastMsgPreview] = useState("");
+  const [natsUsingSubject, setNatsUsingSubject] = useState(FORCE_GPS_SUBJECT);
+
   // Refs to avoid stale closures inside timers
   const userNameRef = useRef(userName);
   const activePairRef = useRef(activePair);
   const pairPromptRef = useRef(pairPrompt);
 
-  useEffect(() => { userNameRef.current = userName; }, [userName]);
-  useEffect(() => { activePairRef.current = activePair; }, [activePair]);
-  useEffect(() => { pairPromptRef.current = pairPrompt; }, [pairPrompt]);
+  useEffect(() => {
+    userNameRef.current = userName;
+  }, [userName]);
+  useEffect(() => {
+    activePairRef.current = activePair;
+  }, [activePair]);
+  useEffect(() => {
+    pairPromptRef.current = pairPrompt;
+  }, [pairPrompt]);
 
   // Phone session ref
   const phoneSessionRef = useRef({
@@ -121,6 +138,13 @@ function App() {
     // Pairing
     setPairPrompt(null);
     setActivePair(null);
+
+    // Debug
+    setNatsMsgCount(0);
+    setNatsLastSubject("");
+    setNatsLastMsgAt("");
+    setNatsLastMsgPreview("");
+    setNatsSubStatus("not_started");
   };
 
   const handleLogout = async () => {
@@ -140,6 +164,7 @@ function App() {
     } finally {
       setNatsStatus("disconnected");
       setNatsError("");
+      setNatsSubStatus("unsubscribed");
     }
   };
 
@@ -311,6 +336,8 @@ function App() {
     if (!shouldTrackPhone) return;
     resetAllRuntimeState();
 
+    console.log("[GPS] Starting phone/device geolocation watch...");
+
     const watchId = navigator.geolocation.watchPosition(
       (pos) => {
         const lat = pos.coords.latitude;
@@ -328,12 +355,14 @@ function App() {
           session,
           matchedPolygon: matched,
           onEnter: (poly, entryIso) => {
+            console.log("[GPS] Phone ENTER field:", poly, "at", entryIso);
             setCurrentPolygon(poly);
             setEntryTime(entryIso);
             setExitTime(null);
             maybePromptPairing(poly, phonePoint);
           },
           onComplete: (visit) => {
+            console.log("[GPS] Phone EXIT field:", visit.polygon, "entry:", visit.entryTime, "exit:", visit.exitTime);
             setExitTime(visit.exitTime);
             setCurrentPolygon(null);
 
@@ -399,11 +428,12 @@ function App() {
           maybePromptPairing(matched, phonePoint);
         }
       },
-      (err) => console.error("Geolocation error:", err),
+      (err) => console.error("[GPS] Geolocation error:", err),
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
 
     return () => {
+      console.log("[GPS] Stopping phone/device geolocation watch.");
       navigator.geolocation.clearWatch(watchId);
       clearSessionExitTimer(phoneSessionRef.current);
     };
@@ -418,39 +448,62 @@ function App() {
       if (!shouldUseNatsMachines) return;
 
       const cfg = getNatsEnvConfig();
+      const forcedSubject = FORCE_GPS_SUBJECT; // ✅ you said: for sure
+
+      setNatsUsingSubject(forcedSubject);
       setNatsError("");
       setNatsStatus("connecting");
+      setNatsSubStatus("subscribing");
+
+      console.log("[NATS][App] shouldUseNatsMachines=true. Attempting connect...");
+      console.log("[NATS][App] URL from env (hidden):", cfg?.url ? "(set)" : "(missing)");
+      console.log("[NATS][App] SUBSCRIBE SUBJECT (forced):", forcedSubject);
 
       try {
         await connectNats({ url: cfg.url, name: `metaag-2o-ui:${userId || "anon"}` });
         setNatsStatus("connected");
+        console.log("[NATS][App] Connected OK. Now subscribing...");
 
         unsubscribe = await subscribeJson({
-          subject: cfg.gpsSubject, // e.g. "*.gps.>"
-          onMessage: (msg) => {
-            // Supports your payload example:
-            // {"class":"TPV","device":"fake","status":5,"mode":3,"time":"...","lat":...,"lon":...}
+          subject: forcedSubject,
+          // IMPORTANT: natsService may call onMessage(msg) OR onMessage(msg, subject, raw)
+          onMessage: (msg, subject, raw) => {
+            // ✅ PROVE reception
+            setNatsMsgCount((c) => c + 1);
+            setNatsLastSubject(String(subject || ""));
+            setNatsLastMsgAt(nowIso());
 
+            // preview helps confirm traffic even if parsing/mapping is wrong
+            const preview = (() => {
+              try {
+                if (raw && typeof raw === "string") return raw.slice(0, 220);
+                return JSON.stringify(msg).slice(0, 220);
+              } catch {
+                return "[unpreviewable]";
+              }
+            })();
+            setNatsLastMsgPreview(preview);
+
+            // console log every message (you can turn off later)
+            console.log("[NATS][RX]", { subject, msg });
+
+            // ---- EXISTING FUNCTIONALITY BELOW (unchanged) ----
             const vehicle = String(
-              msg?.device ?? // ✅ your machine id field
-              msg?.vehicle ??
-              msg?.machine ??
-              msg?.vehicleName ??
-              msg?.name ??
-              ""
+              msg?.device ??
+                msg?.vehicle ??
+                msg?.machine ??
+                msg?.vehicleName ??
+                msg?.name ??
+                ""
             ).trim();
 
             const lat = Number(msg?.lat ?? msg?.latitude);
-            const lng = Number(
-              msg?.lng ??
-              msg?.lon ?? // ✅ your longitude field
-              msg?.long ??
-              msg?.longitude
-            );
+            const lng = Number(msg?.lng ?? msg?.lon ?? msg?.long ?? msg?.longitude);
 
             const tsRaw = msg?.time ?? msg?.ts ?? msg?.timestamp ?? null;
             const tsIso = tsRaw ? new Date(tsRaw).toISOString() : new Date().toISOString();
 
+            // If it's not a GPS payload, ignore (but you still counted it in diagnostics)
             if (!vehicle || !isFinite(lat) || !isFinite(lng)) return;
 
             // update machines seen
@@ -468,7 +521,8 @@ function App() {
                   lat,
                   lng,
                   field: matched || null,
-                  raw: msg
+                  raw: msg,
+                  subject: String(subject || "")
                 },
                 ...prev
               ];
@@ -493,12 +547,14 @@ function App() {
               session,
               matchedPolygon: matched,
               onEnter: (poly) => {
+                console.log("[NATS][Machine] ENTER", vehicle, "field:", poly);
                 const phonePoly = phoneSessionRef.current?.currentPolygon;
                 if (phonePoly && phonePoly === poly && phoneSessionRef.current?.lastPoint) {
                   maybePromptPairing(poly, phoneSessionRef.current.lastPoint);
                 }
               },
               onComplete: (visit) => {
+                console.log("[NATS][Machine] EXIT", vehicle, "field:", visit.polygon);
                 machineCompletedRef.current.push({
                   vehicle,
                   field: visit.polygon,
@@ -509,16 +565,22 @@ function App() {
             });
           }
         });
+
+        setNatsSubStatus("subscribed");
+        console.log("[NATS][App] Subscribed OK:", forcedSubject);
       } catch (e) {
-        console.error("NATS connect/subscribe error:", e);
+        console.error("[NATS][App] connect/subscribe error:", e);
         setNatsStatus("error");
-        setNatsError(String(e?.message || e)); // show real error
+        setNatsSubStatus("failed");
+        setNatsError(String(e?.message || e));
       }
     };
 
     run();
 
     return () => {
+      console.log("[NATS][App] cleanup: unsubscribing (if active) for subject:", natsUsingSubject);
+      setNatsSubStatus((s) => (s === "subscribed" ? "unsubscribed" : s));
       try {
         unsubscribe?.();
       } catch {
@@ -566,7 +628,9 @@ function App() {
         records: pendingRecords
       };
 
+      console.log("[NATS][Publish] Sending records:", pendingRecords.length);
       await publishJson({ subject: cfg.recordsPublishSubject, data: payload });
+
       setLastSendInfo(`Sent ${pendingRecords.length} record(s) at ${new Date().toLocaleTimeString()}`);
       setPendingRecords([]);
     } catch (e) {
@@ -638,7 +702,7 @@ function App() {
                   <strong>User:</strong> {userName}
                 </div>
 
-                {/* ✅ show device/browser GPS */}
+                {/* show device/browser GPS */}
                 <div style={{ marginTop: 6 }}>
                   <strong>My GPS:</strong>{" "}
                   {position ? `${position.lat.toFixed(5)}, ${position.lng.toFixed(5)}` : "Locating..."}
@@ -647,6 +711,24 @@ function App() {
                 <div style={{ marginTop: 6 }}>
                   <strong>NATS:</strong> {natsStatus}
                   {natsError ? <div style={{ color: "#b00020" }}>{natsError}</div> : null}
+                </div>
+
+                {/* ✅ debug proof */}
+                <div style={{ marginTop: 6, padding: 8, border: "1px solid #ddd", borderRadius: 8 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 4 }}>NATS Debug</div>
+                  <div style={{ fontSize: 12 }}>
+                    <div><strong>Sub status:</strong> {natsSubStatus}</div>
+                    <div><strong>Subject:</strong> {natsUsingSubject}</div>
+                    <div><strong>Msgs seen:</strong> {natsMsgCount}</div>
+                    {natsLastMsgAt ? <div><strong>Last msg at:</strong> {new Date(natsLastMsgAt).toLocaleTimeString()}</div> : null}
+                    {natsLastSubject ? <div><strong>Last subject:</strong> {natsLastSubject}</div> : null}
+                    {natsLastMsgPreview ? (
+                      <div style={{ marginTop: 4 }}>
+                        <strong>Last preview:</strong>
+                        <div style={{ whiteSpace: "pre-wrap", color: "#555" }}>{natsLastMsgPreview}</div>
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
 
                 <div style={{ marginTop: 6 }}>
@@ -659,7 +741,7 @@ function App() {
                   </div>
                 ) : null}
 
-                {/* ✅ realtime GPS feed */}
+                {/* realtime GPS feed */}
                 <div style={{ marginTop: 12 }}>
                   <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>
                     Live GPS messages ({gpsFeed.length})
@@ -697,14 +779,16 @@ function App() {
 
                           <div style={{ color: "#444", marginTop: 2 }}>
                             {m.lat.toFixed(5)}, {m.lng.toFixed(5)}
-                            {m.raw?.status !== undefined ? (
-                              <span style={{ color: "#666" }}> • status: {m.raw.status}</span>
-                            ) : null}
-                            {m.raw?.mode !== undefined ? (
-                              <span style={{ color: "#666" }}> • mode: {m.raw.mode}</span>
-                            ) : null}
+                            {m.raw?.status !== undefined ? <span style={{ color: "#666" }}> • status: {m.raw.status}</span> : null}
+                            {m.raw?.mode !== undefined ? <span style={{ color: "#666" }}> • mode: {m.raw.mode}</span> : null}
                             {m.raw?.class ? <span style={{ color: "#666" }}> • class: {m.raw.class}</span> : null}
                           </div>
+
+                          {m.subject ? (
+                            <div style={{ color: "#777", marginTop: 2 }}>
+                              subject: {m.subject}
+                            </div>
+                          ) : null}
                         </div>
                       ))
                     )}
@@ -738,7 +822,10 @@ function App() {
                 <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.5rem" }}>
                   <button
                     type="button"
-                    onClick={() => { setAuthTab("login"); setAuthError(""); }}
+                    onClick={() => {
+                      setAuthTab("login");
+                      setAuthError("");
+                    }}
                     style={{
                       flex: 1,
                       background: authTab === "login" ? "#007bff" : "#e9ecef",
@@ -753,7 +840,10 @@ function App() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => { setAuthTab("register"); setAuthError(""); }}
+                    onClick={() => {
+                      setAuthTab("register");
+                      setAuthError("");
+                    }}
                     style={{
                       flex: 1,
                       background: authTab === "register" ? "#007bff" : "#e9ecef",
@@ -902,10 +992,7 @@ function App() {
         <EnterpriseChatbotRAG
           userId={userId}
           userName={userName}
-          // If your updated EnterpriseChatbotRAG uses this callback, keep it.
-          // Otherwise it will be ignored safely.
           onOperationFinalized={(payload) => {
-            // You can choose to merge these into pendingRecords if you want
             console.log("Enterprise operation finalized:", payload);
           }}
         />
