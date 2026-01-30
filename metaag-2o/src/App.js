@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { GoogleMap, LoadScript, Marker, Polygon } from "@react-google-maps/api";
+import { GoogleMap, LoadScript, Marker, Polygon, Polyline } from "@react-google-maps/api";
 
 import polygons from "./data/polygons.json";
 import { checkInsidePolygon } from "./geo/geo";
@@ -13,6 +13,11 @@ import { connectNats, disconnectNats, getNatsEnvConfig, publishJson, subscribeJs
 
 const containerStyle = { width: "100vw", height: "100vh" };
 const defaultCenter = { lat: 40.421, lng: -86.916 };
+
+// Map drawing knobs (keep UI responsive)
+const MAX_PHONE_POINTS = 500;
+const MAX_MACHINE_POINTS_PER_VEHICLE = 300;
+
 
 const LS_USER_ID = "enterprise_userId";
 const LS_USER_NAME = "enterprise_userName";
@@ -49,6 +54,43 @@ function App() {
   const [currentPolygon, setCurrentPolygon] = useState(null);
   const [entryTime, setEntryTime] = useState(null);
   const [exitTime, setExitTime] = useState(null);
+
+
+  // --- map drawing state (markers + trails) ---
+  const [mapVersion, setMapVersion] = useState(0);
+  const phoneTrailRef = useRef([]); // [{lat,lng}]
+  const machineTrailRef = useRef({}); // { [vehicle]: [{lat,lng}] }
+
+  const bumpMapVersion = () => setMapVersion((v) => (v + 1) % 1_000_000);
+
+  const pushLimited = (arr, point, maxLen) => {
+    arr.push(point);
+    if (arr.length > maxLen) arr.splice(0, arr.length - maxLen);
+  };
+
+  const recordPhonePoint = (pt) => {
+    if (!pt) return;
+    pushLimited(phoneTrailRef.current, pt, MAX_PHONE_POINTS);
+    bumpMapVersion();
+  };
+
+  const recordMachinePoint = (vehicle, pt) => {
+    if (!vehicle || !pt) return;
+    const store = machineTrailRef.current;
+    if (!store[vehicle]) store[vehicle] = [];
+    pushLimited(store[vehicle], pt, MAX_MACHINE_POINTS_PER_VEHICLE);
+    bumpMapVersion();
+  };
+
+  const getLatestMachinePoints = () => {
+    const out = [];
+    const store = machineTrailRef.current;
+    for (const [vehicle, pts] of Object.entries(store)) {
+      const last = pts?.[pts.length - 1];
+      if (last) out.push({ vehicle, point: last });
+    }
+    return out;
+  };
 
   // --- NATS / machine gps ---
   const [natsStatus, setNatsStatus] = useState("disconnected"); // disconnected | connecting | connected | error
@@ -94,7 +136,8 @@ function App() {
     currentPolygon: null,
     entryTime: null,
     exitTimerId: null,
-    lastPoint: null
+    lastPoint: null,
+    powerUnit: null // selected machine that overlaps this visit's polygon
   });
 
   // machineSessionsRef.current[vehicle] = { currentPolygon, entryTime, exitTimerId, lastPoint, lastTsMs }
@@ -123,7 +166,7 @@ function App() {
   const resetAllRuntimeState = () => {
     // Phone
     clearSessionExitTimer(phoneSessionRef.current);
-    phoneSessionRef.current = { currentPolygon: null, entryTime: null, exitTimerId: null, lastPoint: null };
+    phoneSessionRef.current = { currentPolygon: null, entryTime: null, exitTimerId: null, lastPoint: null, powerUnit: null };
     setCurrentPolygon(null);
     setEntryTime(null);
     setExitTime(null);
@@ -226,50 +269,58 @@ function App() {
     }
   };
 
-  const computePairCandidates = (fieldName, phonePoint) => {
+  const computePairCandidatesNearPhone = (phonePoint) => {
+    if (!phonePoint) return [];
     const sessions = machineSessionsRef.current || {};
     const nowMs = Date.now();
     const candidates = [];
 
     for (const [vehicle, sess] of Object.entries(sessions)) {
-      if (!sess?.currentPolygon || sess.currentPolygon !== fieldName) continue;
-      if (!sess.lastTsMs || nowMs - sess.lastTsMs > MACHINE_RECENT_MS) continue;
+      if (!sess?.lastTsMs || nowMs - sess.lastTsMs > MACHINE_RECENT_MS) continue;
+      if (!sess?.lastPoint) continue;
 
-      const dist = phonePoint && sess.lastPoint ? haversineMeters(phonePoint, sess.lastPoint) : Infinity;
+      const dist = haversineMeters(phonePoint, sess.lastPoint);
       if (isFinite(dist) && dist > MACHINE_MAX_DISTANCE_M) continue;
 
-      candidates.push({ vehicle, distanceM: dist });
+      candidates.push({
+        vehicle,
+        distanceM: dist,
+        field: sess.currentPolygon || null
+      });
     }
 
     candidates.sort((a, b) => (a.distanceM ?? Infinity) - (b.distanceM ?? Infinity));
     return candidates;
   };
 
-  const maybePromptPairing = (fieldName, phonePoint) => {
-    if (!fieldName) return;
+  const maybePromptPairingNearPhone = (phonePoint) => {
+    if (!phonePoint) return;
 
-    const ap = activePairRef.current;
-    if (ap && ap.field === fieldName) return;
+    // if already selected a machine, don't keep prompting
+    if (activePairRef.current?.vehicle) return;
 
-    if (pairPromptRef.current?.field === fieldName) return;
+    // don't reprompt if prompt already open
+    if (pairPromptRef.current) return;
 
-    const candidates = computePairCandidates(fieldName, phonePoint);
+    const candidates = computePairCandidatesNearPhone(phonePoint);
     if (!candidates.length) return;
 
+    const list = candidates.map((c) => c.vehicle).join(", ");
     const first = candidates[0]?.vehicle;
+
     setPairPrompt({
-      field: fieldName,
+      field: null,
       candidates,
       selectedVehicle: first || ""
     });
 
-    if (first) {
-      maybeNotify("MetaAg", `Confirm you're with ${first} in ${fieldName}`);
+    if (list) {
+      maybeNotify("MetaAg", `I found these machines: ${list}. Which one are you operating?`);
     }
   };
 
   const confirmPairing = () => {
-    if (!pairPrompt?.selectedVehicle || !pairPrompt?.field) {
+    if (!pairPrompt?.selectedVehicle) {
       setPairPrompt(null);
       return;
     }
@@ -277,16 +328,25 @@ function App() {
     const next = {
       person: userNameRef.current || "",
       vehicle: pairPrompt.selectedVehicle,
-      field: pairPrompt.field,
       confirmedAt: nowIso()
     };
+
     setActivePair(next);
     setPairPrompt(null);
+
+    // If the phone is already in a field and the selected machine is also in that field,
+    // mark it as power unit immediately for this visit.
+    const phonePoly = phoneSessionRef.current?.currentPolygon;
+    const msess = machineSessionsRef.current?.[next.vehicle];
+    if (phonePoly && msess?.currentPolygon === phonePoly) {
+      phoneSessionRef.current.powerUnit = next.vehicle;
+    }
   };
 
   const clearPairing = () => {
     setActivePair(null);
     setPairPrompt(null);
+    phoneSessionRef.current.powerUnit = null;
   };
 
   // --- Visit sessionization (shared for phone and machine) ---
@@ -351,6 +411,12 @@ function App() {
         const prevPoly = session.currentPolygon;
         session.lastPoint = { lat, lng };
 
+        // record for map markers/trail
+        recordPhonePoint(phonePoint);
+
+        // Proximity-based pairing prompt (inside or outside fields)
+        maybePromptPairingNearPhone(phonePoint);
+
         sessionizePoint({
           session,
           matchedPolygon: matched,
@@ -359,15 +425,19 @@ function App() {
             setCurrentPolygon(poly);
             setEntryTime(entryIso);
             setExitTime(null);
-            maybePromptPairing(poly, phonePoint);
+
+            // If a machine is already selected and it's also in this field, mark it as power unit for this visit.
+            const ap = activePairRef.current;
+            const msess = ap?.vehicle ? machineSessionsRef.current?.[ap.vehicle] : null;
+            phoneSessionRef.current.powerUnit = msess?.currentPolygon === poly ? ap.vehicle : null;
           },
           onComplete: (visit) => {
             console.log("[GPS] Phone EXIT field:", visit.polygon, "entry:", visit.entryTime, "exit:", visit.exitTime);
             setExitTime(visit.exitTime);
             setCurrentPolygon(null);
+            phoneSessionRef.current.powerUnit = null;
 
-            const ap = activePairRef.current;
-            const pairedVehicle = ap && ap.field === visit.polygon ? ap.vehicle : null;
+            const pairedVehicle = phoneSessionRef.current?.powerUnit || null;
 
             // Find machine overlap (best-effort)
             let machineVisit = null;
@@ -424,9 +494,7 @@ function App() {
           }
         });
 
-        if (matched && matched === prevPoly) {
-          maybePromptPairing(matched, phonePoint);
-        }
+        // pairing prompt handled by maybePromptPairingNearPhone(phonePoint) above
       },
       (err) => console.error("[GPS] Geolocation error:", err),
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
@@ -548,11 +616,15 @@ function App() {
               matchedPolygon: matched,
               onEnter: (poly) => {
                 console.log("[NATS][Machine] ENTER", vehicle, "field:", poly);
+
+                // If phone is in the same field and this machine is the selected one, mark as power unit
                 const phonePoly = phoneSessionRef.current?.currentPolygon;
-                if (phonePoly && phonePoly === poly && phoneSessionRef.current?.lastPoint) {
-                  maybePromptPairing(poly, phoneSessionRef.current.lastPoint);
+                const ap = activePairRef.current;
+                if (phonePoly && phonePoly === poly && ap?.vehicle === vehicle) {
+                  phoneSessionRef.current.powerUnit = vehicle;
                 }
               },
+
               onComplete: (visit) => {
                 console.log("[NATS][Machine] EXIT", vehicle, "field:", visit.polygon);
                 machineCompletedRef.current.push({
@@ -664,8 +736,116 @@ function App() {
             }}
           />
         ))}
+        {/* phone trail markers (all received points) */}
+        {phoneTrailRef.current.map((pt, idx) => (
+          <Marker
+            key={`p-${idx}-${mapVersion}`}
+            position={pt}
+            options={{
+              icon: window.google
+                ? {
+                    path: window.google.maps.SymbolPath.CIRCLE,
+                    scale: 3,
+                    fillColor: "#1f77b4",
+                    fillOpacity: 1,
+                    strokeColor: "#1f77b4",
+                    strokeWeight: 1
+                  }
+                : undefined
+            }}
+          />
+        ))}
+
+        {/* machine live markers (latest point per machine) */}
+        {getLatestMachinePoints().map(({ vehicle, point }) => (
+          <Marker
+            key={`m-${vehicle}-${mapVersion}`}
+            position={point}
+            title={vehicle}
+            options={{
+              icon: window.google
+                ? {
+                    path: window.google.maps.SymbolPath.CIRCLE,
+                    scale: 4,
+                    fillColor: "#666666",
+                    fillOpacity: 1,
+                    strokeColor: "#666666",
+                    strokeWeight: 1
+                  }
+                : undefined
+            }}
+          />
+        ))}
+
+        {/* phone trail line */}
+        {phoneTrailRef.current.length ? (
+          <Polyline path={phoneTrailRef.current} options={{ strokeOpacity: 1, strokeWeight: 3, strokeColor: "#1f77b4" }} />
+        ) : null}
+
+        {/* paired machine: highlight + trail */}
+        {activePairRef.current?.vehicle && machineTrailRef.current?.[activePairRef.current.vehicle]?.length ? (
+          <>
+            <Polyline
+              path={machineTrailRef.current[activePairRef.current.vehicle]}
+              options={{ strokeOpacity: 1, strokeWeight: 3, strokeColor: "#d62728" }}
+            />
+            <Marker
+              position={
+                machineTrailRef.current[activePairRef.current.vehicle][
+                  machineTrailRef.current[activePairRef.current.vehicle].length - 1
+                ]
+              }
+              title={`Paired: ${activePairRef.current.vehicle}`}
+              options={{
+                icon: window.google
+                  ? {
+                      path: window.google.maps.SymbolPath.CIRCLE,
+                      scale: 7,
+                      fillColor: "#d62728",
+                      fillOpacity: 1,
+                      strokeColor: "#ffffff",
+                      strokeWeight: 2
+                    }
+                  : undefined
+              }}
+            />
+          </>
+        ) : null}
+
         {position && <Marker position={position} />}
       </GoogleMap>
+
+      
+      {/* bottom-left legends */}
+      <div
+        style={{
+          position: "absolute",
+          bottom: 12,
+          left: 12,
+          background: "rgba(255, 255, 255, 0.9)",
+          padding: "10px 12px",
+          borderRadius: "8px",
+          boxShadow: "0 2px 8px rgba(0,0,0,0.2)",
+          zIndex: 1000,
+          fontSize: "12px",
+          lineHeight: 1.4,
+          maxWidth: "260px"
+        }}
+      >
+        <div style={{ fontWeight: 700, marginBottom: 6 }}>Legend</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          <span style={{ width: 10, height: 10, borderRadius: 999, background: "#1f77b4", display: "inline-block" }} />
+          <span>Browser/Device GPS points + path</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          <span style={{ width: 10, height: 10, borderRadius: 999, background: "#666666", display: "inline-block" }} />
+          <span>Machines seen (latest point)</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ width: 10, height: 10, borderRadius: 999, background: "#d62728", display: "inline-block" }} />
+          <span>Paired machine live point + path</span>
+        </div>
+      </div>
 
       {/* top-right overlay */}
       <div
@@ -799,9 +979,6 @@ function App() {
                   <div style={{ marginTop: 10, padding: 8, border: "1px solid #ddd", borderRadius: 6 }}>
                     <div>
                       <strong>Paired:</strong> {activePair.vehicle}
-                    </div>
-                    <div>
-                      <strong>Field:</strong> {activePair.field}
                     </div>
                     <button type="button" onClick={clearPairing} style={{ marginTop: 6, width: "100%" }}>
                       Change / Clear pairing
@@ -948,7 +1125,7 @@ function App() {
         >
           <div style={{ fontWeight: 700, marginBottom: 6 }}>Confirm machine</div>
           <div style={{ fontSize: 14, marginBottom: 10 }}>
-            Your phone is in <strong>{pairPrompt.field}</strong>. Are you with:
+            I found these machines nearby. Which one are you operating?
           </div>
 
           {pairPrompt.candidates.length > 1 ? (
@@ -960,7 +1137,8 @@ function App() {
               {pairPrompt.candidates.map((c) => (
                 <option key={c.vehicle} value={c.vehicle}>
                   {c.vehicle}
-                  {isFinite(c.distanceM) ? ` (≈ ${Math.round(c.distanceM)}m)` : ""}
+                  {c.field ? ` • IN: ${c.field}` : " • OUTSIDE"}
+                  {isFinite(c.distanceM) ? ` • ≈ ${Math.round(c.distanceM)}m` : ""}
                 </option>
               ))}
             </select>
