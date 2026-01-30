@@ -107,6 +107,8 @@ function App() {
   // --- records (built locally, published to NATS on Send) ---
   const [pendingRecords, setPendingRecords] = useState([]); // unsent
   const [lastSendInfo, setLastSendInfo] = useState("");
+  const [chatbotResetKey, setChatbotResetKey] = useState(0);
+
 
   // ✅ DEBUG/DIAGNOSTICS (proves subscription + message receipt)
   const [natsSubStatus, setNatsSubStatus] = useState("not_started"); // not_started|subscribing|subscribed|failed|unsubscribed
@@ -434,10 +436,12 @@ function App() {
           onComplete: (visit) => {
             console.log("[GPS] Phone EXIT field:", visit.polygon, "entry:", visit.entryTime, "exit:", visit.exitTime);
             setExitTime(visit.exitTime);
-            setCurrentPolygon(null);
-            phoneSessionRef.current.powerUnit = null;
 
+            // Capture powerUnit BEFORE clearing it (used as paired vehicle for this visit)
             const pairedVehicle = phoneSessionRef.current?.powerUnit || null;
+
+            setCurrentPolygon(null);
+
 
             // Find machine overlap (best-effort)
             let machineVisit = null;
@@ -491,6 +495,12 @@ function App() {
             };
 
             setPendingRecords((prev) => [record, ...prev]);
+
+            // Clear power unit after we finalize this visit record
+            phoneSessionRef.current.powerUnit = null;
+
+            // Force chatbots to refresh their internal state after a completed visit
+            setChatbotResetKey((k) => k + 1);
           }
         });
 
@@ -557,7 +567,11 @@ function App() {
 
             // ---- EXISTING FUNCTIONALITY BELOW (unchanged) ----
             const vehicle = String(
-              msg?.device ??
+              msg?.deviceId ??
+                msg?.device_id ??
+                msg?.machineId ??
+                msg?.machine_id ??
+                msg?.device ??
                 msg?.vehicle ??
                 msg?.machine ??
                 msg?.vehicleName ??
@@ -573,6 +587,13 @@ function App() {
 
             // If it's not a GPS payload, ignore (but you still counted it in diagnostics)
             if (!vehicle || !isFinite(lat) || !isFinite(lng)) return;
+
+            // record for map markers/trail (all machine points)
+            recordMachinePoint(vehicle, { lat, lng });
+
+            // Option A: recompute nearby machines when a machine GPS arrives (phone may be stationary)
+            const phoneLast = phoneSessionRef.current?.lastPoint;
+            if (phoneLast) maybePromptPairingNearPhone(phoneLast);
 
             // update machines seen
             setMachinesSeen((prev) => (prev.includes(vehicle) ? prev : [...prev, vehicle].sort()));
@@ -718,10 +739,83 @@ function App() {
     feature.geometry.coordinates[0].map(([lng, lat]) => ({ lat, lng }))
   );
 
+
+  // --- Map render snapshots (driven by mapVersion) ---
+  const phoneTrail = useMemo(() => phoneTrailRef.current.slice(), [mapVersion]);
+
+  const machineTrails = useMemo(() => {
+    const store = machineTrailRef.current || {};
+    const out = {};
+    for (const [v, pts] of Object.entries(store)) out[v] = pts.slice();
+    return out;
+  }, [mapVersion]);
+
+  const latestMachinePoints = useMemo(() => getLatestMachinePoints(), [mapVersion]);
+
+  const pairedVehicle = activePair?.vehicle || null;
+  const pairedTrail = useMemo(() => {
+    if (!pairedVehicle) return [];
+    return (machineTrailRef.current?.[pairedVehicle] || []).slice();
+  }, [mapVersion, pairedVehicle]);
+
+  const pairedLivePoint = useMemo(() => {
+    if (!pairedVehicle) return null;
+    const pts = machineTrailRef.current?.[pairedVehicle] || [];
+    return pts.length ? pts[pts.length - 1] : null;
+  }, [mapVersion, pairedVehicle]);
+
+  // --- Marker icons (Google Maps) ---
+  const makeCircleIcon = (fillColor, scale = 5, strokeColor = "#ffffff") => {
+    const g = window.google;
+    // If Google Maps symbols are available, use the native circle symbol.
+    if (g?.maps?.SymbolPath) {
+      return {
+        path: g.maps.SymbolPath.CIRCLE,
+        fillColor,
+        fillOpacity: 1,
+        strokeColor,
+        strokeOpacity: 1,
+        strokeWeight: 1,
+        scale
+      };
+    }
+
+    // Fallback: SVG data URL (prevents default red pins when Maps isn't ready yet).
+    const r = Math.max(2, Math.round(scale));
+    const size = r * 4;
+    const svg = encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">
+        <circle cx="${size / 2}" cy="${size / 2}" r="${r}" fill="${fillColor}" stroke="${strokeColor}" stroke-width="1"/>
+      </svg>`
+    );
+    return `data:image/svg+xml;charset=UTF-8,${svg}`;
+  };
+
+  const makePinIcon = (color) => {
+    // Return an icon even before Google Maps is fully ready (prevents default red pins).
+    const svg = encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24" fill="${color}" stroke="white" stroke-width="1.2">
+        <path d="M12 22s7-7.2 7-13a7 7 0 0 0-14 0c0 5.8 7 13 7 13z"/>
+        <circle cx="12" cy="9" r="2.5" fill="white" stroke="white"/>
+      </svg>`
+    );
+    const url = `data:image/svg+xml;charset=UTF-8,${svg}`;
+
+    const g = window.google;
+    if (!g?.maps) return url;
+
+    return {
+      url,
+      scaledSize: new g.maps.Size(28, 28),
+      anchor: new g.maps.Point(14, 28)
+    };
+  };
+
   // Map shortcut
   if (window.location.hash === "#map") return <FieldMap />;
 
   return (
+    <div style={{ position: "relative", width: "100%", height: "100vh" }}>
     <LoadScript googleMapsApiKey={process.env.REACT_APP_GOOGLE_MAPS_API_KEY}>
       <GoogleMap mapContainerStyle={containerStyle} center={position || defaultCenter} zoom={17}>
         {polygonPaths.map((path, i) => (
@@ -736,87 +830,71 @@ function App() {
             }}
           />
         ))}
-        {/* phone trail markers (all received points) */}
-        {phoneTrailRef.current.map((pt, idx) => (
+
+        {/* Phone/device live location */}
+        {position && <Marker position={position} icon={makePinIcon("#1e88e5")} />}
+
+        {/* All phone/device GPS points */}
+        {phoneTrail.map((pt, idx) => (
           <Marker
-            key={`p-${idx}-${mapVersion}`}
+            key={`phonept_${idx}`}
             position={pt}
-            options={{
-              icon: window.google
-                ? {
-                    path: window.google.maps.SymbolPath.CIRCLE,
-                    scale: 3,
-                    fillColor: "#1f77b4",
-                    fillOpacity: 1,
-                    strokeColor: "#1f77b4",
-                    strokeWeight: 1
-                  }
-                : undefined
-            }}
+            icon={makeCircleIcon("#1e88e5", 3)}
+            clickable={false}
           />
         ))}
 
-        {/* machine live markers (latest point per machine) */}
-        {getLatestMachinePoints().map(({ vehicle, point }) => (
-          <Marker
-            key={`m-${vehicle}-${mapVersion}`}
-            position={point}
-            title={vehicle}
-            options={{
-              icon: window.google
-                ? {
-                    path: window.google.maps.SymbolPath.CIRCLE,
-                    scale: 4,
-                    fillColor: "#666666",
-                    fillOpacity: 1,
-                    strokeColor: "#666666",
-                    strokeWeight: 1
-                  }
-                : undefined
-            }}
-          />
-        ))}
-
-        {/* phone trail line */}
-        {phoneTrailRef.current.length ? (
-          <Polyline path={phoneTrailRef.current} options={{ strokeOpacity: 1, strokeWeight: 3, strokeColor: "#1f77b4" }} />
-        ) : null}
-
-        {/* paired machine: highlight + trail */}
-        {activePairRef.current?.vehicle && machineTrailRef.current?.[activePairRef.current.vehicle]?.length ? (
-          <>
-            <Polyline
-              path={machineTrailRef.current[activePairRef.current.vehicle]}
-              options={{ strokeOpacity: 1, strokeWeight: 3, strokeColor: "#d62728" }}
-            />
+        {/* All machine GPS points (all machines, limited per vehicle) */}
+        {Object.entries(machineTrails).map(([vehicle, pts]) =>
+          pts.map((pt, idx) => (
             <Marker
-              position={
-                machineTrailRef.current[activePairRef.current.vehicle][
-                  machineTrailRef.current[activePairRef.current.vehicle].length - 1
-                ]
-              }
-              title={`Paired: ${activePairRef.current.vehicle}`}
-              options={{
-                icon: window.google
-                  ? {
-                      path: window.google.maps.SymbolPath.CIRCLE,
-                      scale: 7,
-                      fillColor: "#d62728",
-                      fillOpacity: 1,
-                      strokeColor: "#ffffff",
-                      strokeWeight: 2
-                    }
-                  : undefined
-              }}
+              key={`mpt_${vehicle}_${idx}`}
+              position={pt}
+              icon={makeCircleIcon("#2e7d32", 3)}
+              clickable={false}
             />
-          </>
-        ) : null}
+          ))
+        )}
 
-        {position && <Marker position={position} />}
-      </GoogleMap>
+        {/* Latest seen position per machine */}
+        {latestMachinePoints.map(({ vehicle, point }) => {
+          const isPaired = pairedVehicle && vehicle === pairedVehicle;
+          return (
+            <Marker
+              key={`mlive_${vehicle}`}
+              position={point}
+              icon={isPaired ? makePinIcon("#e53935") : makePinIcon("#2e7d32")}
+              title={isPaired ? `Paired: ${vehicle}` : `Seen: ${vehicle}`}
+            />
+          );
+        })}
 
-      
-      {/* bottom-left legends */}
+        {/* Trails: phone + paired machine */}
+        {phoneTrail.length > 1 && (
+          <Polyline
+            path={phoneTrail}
+            options={{
+              strokeColor: "#1e88e5",
+              strokeOpacity: 1,
+              strokeWeight: 3
+            }}
+          />
+        )}
+
+        {pairedTrail.length > 1 && (
+          <Polyline
+            path={pairedTrail}
+            options={{
+              strokeColor: "#e53935",
+              strokeOpacity: 1,
+              strokeWeight: 3
+            }}
+          />
+        )}
+</GoogleMap>
+    </LoadScript>
+
+{/* bottom-left legends */}
       <div
         style={{
           position: "absolute",
@@ -1164,10 +1242,11 @@ function App() {
       ) : null}
 
       {/* Chatbots */}
-      {mode === "personal" ? <Chatbot apiKey={process.env.REACT_APP_OPENAI_API_KEY} /> : null}
+      {mode === "personal" ? <Chatbot key={`cb_${chatbotResetKey}`} apiKey={process.env.REACT_APP_OPENAI_API_KEY} /> : null}
 
       {mode === "enterprise" && isEnterpriseAuthed ? (
         <EnterpriseChatbotRAG
+          key={`ecb_${chatbotResetKey}`}
           userId={userId}
           userName={userName}
           onOperationFinalized={(payload) => {
@@ -1175,7 +1254,8 @@ function App() {
           }}
         />
       ) : null}
-    </LoadScript>
+    
+    </div>
   );
 }
 
