@@ -1,0 +1,1 @@
+PS C:\Users\samif> docker run --name nats -p 4222:4222 -p 8222:8222 -p 9222:9222 -v C:\nats\nats.conf:/etc/nats/nats.conf nats:latest -c /etc/nats/nats.conf
