@@ -33,7 +33,7 @@ const MACHINE_MAX_DISTANCE_M = 500; // optional safety: phone must be within 500
 const GPS_FEED_MAX = 30;
 
 // ✅ hard requirement from you:
-const FORCE_GPS_SUBJECT = "*.gps.TPV>";
+const FORCE_GPS_SUBJECT = "*.gps.TPV";
 
 function App() {
   const [mode, setMode] = useState("enterprise"); // "enterprise" | "personal"
