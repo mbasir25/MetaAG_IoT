@@ -11,13 +11,12 @@ import { haversineMeters } from "./utils/haversine";
 import { registerEnterpriseUserLocal, loginEnterpriseUserLocal } from "./services/localEnterpriseAuth";
 import { connectNats, disconnectNats, getNatsEnvConfig, publishJson, subscribeJson } from "./services/natsService";
 
-const containerStyle = { width: "100vw", height: "100vh" };
+const containerStyle = { width: "100%", height: "100%" };
 const defaultCenter = { lat: 40.421, lng: -86.916 };
 
 // Map drawing knobs (keep UI responsive)
 const MAX_PHONE_POINTS = 500;
 const MAX_MACHINE_POINTS_PER_VEHICLE = 300;
-
 
 const LS_USER_ID = "enterprise_userId";
 const LS_USER_NAME = "enterprise_userName";
@@ -54,7 +53,6 @@ function App() {
   const [currentPolygon, setCurrentPolygon] = useState(null);
   const [entryTime, setEntryTime] = useState(null);
   const [exitTime, setExitTime] = useState(null);
-
 
   // --- map drawing state (markers + trails) ---
   const [mapVersion, setMapVersion] = useState(0);
@@ -108,7 +106,6 @@ function App() {
   const [pendingRecords, setPendingRecords] = useState([]); // unsent
   const [lastSendInfo, setLastSendInfo] = useState("");
   const [chatbotResetKey, setChatbotResetKey] = useState(0);
-
 
   // ✅ DEBUG/DIAGNOSTICS (proves subscription + message receipt)
   const [natsSubStatus, setNatsSubStatus] = useState("not_started"); // not_started|subscribing|subscribed|failed|unsubscribed
@@ -410,7 +407,6 @@ function App() {
         const matched = checkInsidePolygon([lng, lat], polygons);
 
         const session = phoneSessionRef.current;
-        const prevPoly = session.currentPolygon;
         session.lastPoint = { lat, lng };
 
         // record for map markers/trail
@@ -441,7 +437,6 @@ function App() {
             const pairedVehicle = phoneSessionRef.current?.powerUnit || null;
 
             setCurrentPolygon(null);
-
 
             // Find machine overlap (best-effort)
             let machineVisit = null;
@@ -503,8 +498,6 @@ function App() {
             setChatbotResetKey((k) => k + 1);
           }
         });
-
-        // pairing prompt handled by maybePromptPairingNearPhone(phonePoint) above
       },
       (err) => console.error("[GPS] Geolocation error:", err),
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
@@ -562,10 +555,8 @@ function App() {
             })();
             setNatsLastMsgPreview(preview);
 
-            // console log every message (you can turn off later)
             console.log("[NATS][RX]", { subject, msg });
 
-            // ---- EXISTING FUNCTIONALITY BELOW (unchanged) ----
             const vehicle = String(
               msg?.deviceId ??
                 msg?.device_id ??
@@ -739,7 +730,6 @@ function App() {
     feature.geometry.coordinates[0].map(([lng, lat]) => ({ lat, lng }))
   );
 
-
   // --- Map render snapshots (driven by mapVersion) ---
   const phoneTrail = useMemo(() => phoneTrailRef.current.slice(), [mapVersion]);
 
@@ -764,15 +754,29 @@ function App() {
     return pts.length ? pts[pts.length - 1] : null;
   }, [mapVersion, pairedVehicle]);
 
+  const currentMachineName = pairedVehicle || gpsFeed[0]?.vehicle || machinesSeen[0] || "—";
+  const statusTone =
+    natsStatus === "connected"
+      ? "#1f7a1f"
+      : natsStatus === "connecting"
+        ? "#9a6700"
+        : natsStatus === "error"
+          ? "#b00020"
+          : "#666";
+
+  const activeFieldLabel = currentPolygon || gpsFeed[0]?.field || pairPrompt?.field || null;
+  const chatbotPromptText = activeFieldLabel
+    ? `Hey there, I see you did work in field ${activeFieldLabel}.`
+    : "Chatbot prompt will appear when a field visit is detected.";
+
   // --- Marker icons (Google Maps) ---
   const makeCircleIcon = (fillColor, scale = 5, strokeColor = "#ffffff") => {
     const g = window.google;
-    // If Google Maps symbols are available, use the native circle symbol.
     if (g?.maps?.SymbolPath) {
       return {
         path: g.maps.SymbolPath.CIRCLE,
         fillColor,
-        fillOpacity: 1,
+        fillOpacity: fillColor === "#ffffff" ? 0.92 : 1,
         strokeColor,
         strokeOpacity: 1,
         strokeWeight: 1,
@@ -780,7 +784,6 @@ function App() {
       };
     }
 
-    // Fallback: SVG data URL (prevents default red pins when Maps isn't ready yet).
     const r = Math.max(2, Math.round(scale));
     const size = r * 4;
     const svg = encodeURIComponent(
@@ -792,7 +795,6 @@ function App() {
   };
 
   const makePinIcon = (color) => {
-    // Return an icon even before Google Maps is fully ready (prevents default red pins).
     const svg = encodeURIComponent(
       `<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24" fill="${color}" stroke="white" stroke-width="1.2">
         <path d="M12 22s7-7.2 7-13a7 7 0 0 0-14 0c0 5.8 7 13 7 13z"/>
@@ -811,394 +813,569 @@ function App() {
     };
   };
 
+  const makeTractorIcon = () => {
+    const svg = encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="52" height="52" viewBox="0 0 64 64">
+        <circle cx="19" cy="45" r="9" fill="#2d3748" stroke="#ffffff" stroke-width="2"/>
+        <circle cx="47" cy="47" r="13" fill="#2d3748" stroke="#ffffff" stroke-width="2"/>
+        <circle cx="19" cy="45" r="4" fill="#a0aec0"/>
+        <circle cx="47" cy="47" r="6" fill="#a0aec0"/>
+        <path d="M13 38h20l6-10h8l4 10h5v7h-7" fill="#f6ad55" stroke="#2d3748" stroke-width="2"/>
+        <path d="M30 18h10l5 12H30z" fill="#90cdf4" stroke="#2d3748" stroke-width="2"/>
+        <path d="M22 26h8v12h-8z" fill="#f6ad55" stroke="#2d3748" stroke-width="2"/>
+      </svg>`
+    );
+    const url = `data:image/svg+xml;charset=UTF-8,${svg}`;
+    const g = window.google;
+    if (!g?.maps) return url;
+    return {
+      url,
+      scaledSize: new g.maps.Size(36, 36),
+      anchor: new g.maps.Point(18, 24)
+    };
+  };
+
+  const pointIsInsideField = (pt) => {
+    if (!pt) return false;
+    return !!checkInsidePolygon([pt.lng, pt.lat], polygons);
+  };
+
   // Map shortcut
   if (window.location.hash === "#map") return <FieldMap />;
 
   return (
-    <div style={{ position: "relative", width: "100%", height: "100vh" }}>
-    <LoadScript googleMapsApiKey={process.env.REACT_APP_GOOGLE_MAPS_API_KEY}>
-      <GoogleMap mapContainerStyle={containerStyle} center={position || defaultCenter} zoom={17}>
-        {polygonPaths.map((path, i) => (
-          <Polygon
-            key={i}
-            paths={path}
-            options={{
-              strokeColor: "#007bff",
-              fillColor: "#cce5ff",
-              strokeWeight: 2,
-              fillOpacity: 0.2
-            }}
-          />
-        ))}
-
-        {/* Phone/device live location */}
-        {position && <Marker position={position} icon={makePinIcon("#1e88e5")} />}
-
-        {/* All phone/device GPS points */}
-        {phoneTrail.map((pt, idx) => (
-          <Marker
-            key={`phonept_${idx}`}
-            position={pt}
-            icon={makeCircleIcon("#1e88e5", 3)}
-            clickable={false}
-          />
-        ))}
-
-        {/* All machine GPS points (all machines, limited per vehicle) */}
-        {Object.entries(machineTrails).map(([vehicle, pts]) =>
-          pts.map((pt, idx) => (
-            <Marker
-              key={`mpt_${vehicle}_${idx}`}
-              position={pt}
-              icon={makeCircleIcon("#2e7d32", 3)}
-              clickable={false}
-            />
-          ))
-        )}
-
-        {/* Latest seen position per machine */}
-        {latestMachinePoints.map(({ vehicle, point }) => {
-          const isPaired = pairedVehicle && vehicle === pairedVehicle;
-          return (
-            <Marker
-              key={`mlive_${vehicle}`}
-              position={point}
-              icon={isPaired ? makePinIcon("#e53935") : makePinIcon("#2e7d32")}
-              title={isPaired ? `Paired: ${vehicle}` : `Seen: ${vehicle}`}
-            />
-          );
-        })}
-
-        {/* Trails: phone + paired machine */}
-        {phoneTrail.length > 1 && (
-          <Polyline
-            path={phoneTrail}
-            options={{
-              strokeColor: "#1e88e5",
-              strokeOpacity: 1,
-              strokeWeight: 3
-            }}
-          />
-        )}
-
-        {pairedTrail.length > 1 && (
-          <Polyline
-            path={pairedTrail}
-            options={{
-              strokeColor: "#e53935",
-              strokeOpacity: 1,
-              strokeWeight: 3
-            }}
-          />
-        )}
-</GoogleMap>
-    </LoadScript>
-
-{/* bottom-left legends */}
+    <div
+      style={{
+        width: "100%",
+        height: "100vh",
+        background: "#eef3e8",
+        overflow: "hidden",
+        position: "relative"
+      }}
+    >
       <div
         style={{
-          position: "absolute",
-          bottom: 12,
-          left: 12,
-          background: "rgba(255, 255, 255, 0.9)",
-          padding: "10px 12px",
-          borderRadius: "8px",
-          boxShadow: "0 2px 8px rgba(0,0,0,0.2)",
-          zIndex: 1000,
-          fontSize: "12px",
-          lineHeight: 1.4,
-          maxWidth: "260px"
+          display: "flex",
+          gap: 14,
+          width: "100%",
+          height: "100%",
+          padding: 14,
+          boxSizing: "border-box"
         }}
       >
-        <div style={{ fontWeight: 700, marginBottom: 6 }}>Legend</div>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-          <span style={{ width: 10, height: 10, borderRadius: 999, background: "#1f77b4", display: "inline-block" }} />
-          <span>Browser/Device GPS points + path</span>
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-          <span style={{ width: 10, height: 10, borderRadius: 999, background: "#666666", display: "inline-block" }} />
-          <span>Machines seen (latest point)</span>
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ width: 10, height: 10, borderRadius: 999, background: "#d62728", display: "inline-block" }} />
-          <span>Paired machine live point + path</span>
-        </div>
-      </div>
+        <div
+          style={{
+            width: "26%",
+            minWidth: 290,
+            maxWidth: 380,
+            display: "flex",
+            flexDirection: "column",
+            gap: 12,
+            minHeight: 0
+          }}
+        >
+          <div
+            style={{
+              background: "#ffffff",
+              border: "1px solid #d6decf",
+              borderRadius: 14,
+              padding: 14,
+              boxShadow: "0 8px 22px rgba(0,0,0,0.08)"
+            }}
+          >
+            <div style={{ fontSize: 12, fontWeight: 700, color: "#4e5b47", textTransform: "uppercase", letterSpacing: 0.5 }}>
+              Activity prompt
+            </div>
+            <div style={{ marginTop: 8, fontSize: 18, fontWeight: 600, lineHeight: 1.35 }}>{chatbotPromptText}</div>
+            <button
+              type="button"
+              onClick={() => alert("Use the chatbot panel below to log activity.")}
+              style={{
+                marginTop: 12,
+                width: "100%",
+                padding: "12px 14px",
+                borderRadius: 10,
+                border: "1px solid #1f4d2c",
+                background: "#1f4d2c",
+                color: "#fff",
+                fontWeight: 700,
+                cursor: "pointer"
+              }}
+            >
+              Log Activity
+            </button>
+          </div>
 
-      {/* top-right overlay */}
-      <div
-        style={{
-          position: "absolute",
-          top: 10,
-          right: 10,
-          background: "rgba(255, 255, 255, 0.9)",
-          padding: "1rem",
-          borderRadius: "8px",
-          boxShadow: "0 2px 8px rgba(0,0,0,0.2)",
-          zIndex: 1000,
-          maxWidth: "360px",
-          width: "360px"
-        }}
-      >
-        <h3 style={{ marginTop: 0 }}>MetaAg 2o</h3>
-
-        <div style={{ marginBottom: "0.75rem" }}>
-          <label>
-            Mode:{" "}
-            <select value={mode} onChange={(e) => setMode(e.target.value)}>
-              <option value="personal">Personal</option>
-              <option value="enterprise">Enterprise</option>
-            </select>
-          </label>
-        </div>
-
-        {mode === "enterprise" && (
-          <div style={{ marginBottom: "1rem" }}>
-            {isEnterpriseAuthed ? (
-              <div style={{ fontSize: "14px" }}>
-                <div>
-                  <strong>User:</strong> {userName}
+          <div
+            style={{
+              position: "relative",
+              flex: 1,
+              minHeight: 0,
+              overflow: "hidden",
+              background: "#ffffff",
+              border: "1px solid #d6decf",
+              borderRadius: 14,
+              boxShadow: "0 8px 22px rgba(0,0,0,0.08)"
+            }}
+          >
+            <div style={{ padding: "12px 14px 0", fontWeight: 700, color: "#243120" }}>Assistant</div>
+            <div style={{ position: "relative", height: "calc(100% - 40px)", minHeight: 340 }}>
+              {mode === "personal" ? (
+                <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
+                  <div style={{ position: "absolute", inset: 0, background: "#fff" }} />
+                  <Chatbot key={`cb_${chatbotResetKey}`} apiKey={process.env.REACT_APP_OPENAI_API_KEY} />
                 </div>
-
-                {/* show device/browser GPS */}
-                <div style={{ marginTop: 6 }}>
-                  <strong>My GPS:</strong>{" "}
-                  {position ? `${position.lat.toFixed(5)}, ${position.lng.toFixed(5)}` : "Locating..."}
-                </div>
-
-                <div style={{ marginTop: 6 }}>
-                  <strong>NATS:</strong> {natsStatus}
-                  {natsError ? <div style={{ color: "#b00020" }}>{natsError}</div> : null}
-                </div>
-
-                {/* ✅ debug proof */}
-                <div style={{ marginTop: 6, padding: 8, border: "1px solid #ddd", borderRadius: 8 }}>
-                  <div style={{ fontWeight: 700, marginBottom: 4 }}>NATS Debug</div>
-                  <div style={{ fontSize: 12 }}>
-                    <div><strong>Sub status:</strong> {natsSubStatus}</div>
-                    <div><strong>Subject:</strong> {natsUsingSubject}</div>
-                    <div><strong>Msgs seen:</strong> {natsMsgCount}</div>
-                    {natsLastMsgAt ? <div><strong>Last msg at:</strong> {new Date(natsLastMsgAt).toLocaleTimeString()}</div> : null}
-                    {natsLastSubject ? <div><strong>Last subject:</strong> {natsLastSubject}</div> : null}
-                    {natsLastMsgPreview ? (
-                      <div style={{ marginTop: 4 }}>
-                        <strong>Last preview:</strong>
-                        <div style={{ whiteSpace: "pre-wrap", color: "#555" }}>{natsLastMsgPreview}</div>
-                      </div>
-                    ) : null}
-                  </div>
-                </div>
-
-                <div style={{ marginTop: 6 }}>
-                  <strong>Machines seen:</strong> {machinesSeen.length}
-                </div>
-
-                {machinesSeen.length ? (
-                  <div style={{ marginTop: 6, maxHeight: 60, overflow: "auto", fontSize: 12 }}>
-                    {machinesSeen.join(", ")}
-                  </div>
-                ) : null}
-
-                {/* realtime GPS feed */}
-                <div style={{ marginTop: 12 }}>
-                  <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>
-                    Live GPS messages ({gpsFeed.length})
-                  </div>
-
-                  <div
-                    style={{
-                      border: "1px solid #ddd",
-                      borderRadius: 8,
-                      padding: 8,
-                      maxHeight: 180,
-                      overflow: "auto",
-                      background: "rgba(255,255,255,0.7)",
-                      fontSize: 12
+              ) : mode === "enterprise" && isEnterpriseAuthed ? (
+                <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
+                  <EnterpriseChatbotRAG
+                    key={`ecb_${chatbotResetKey}`}
+                    userId={userId}
+                    userName={userName}
+                    onOperationFinalized={(payload) => {
+                      console.log("Enterprise operation finalized:", payload);
                     }}
-                  >
-                    {gpsFeed.length === 0 ? (
-                      <div style={{ color: "#666" }}>Waiting for messages…</div>
-                    ) : (
-                      gpsFeed.map((m) => (
-                        <div key={m.id} style={{ padding: "6px 0", borderBottom: "1px dashed #e5e5e5" }}>
-                          <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
-                            <div>
-                              <strong>{m.vehicle}</strong>{" "}
-                              <span style={{ color: "#666" }}>{new Date(m.ts).toLocaleTimeString()}</span>
-                            </div>
-                            <div style={{ fontWeight: 700 }}>
-                              {m.field ? (
-                                <span style={{ color: "#0a7" }}>IN: {m.field}</span>
-                              ) : (
-                                <span style={{ color: "#b00" }}>OUTSIDE</span>
-                              )}
-                            </div>
-                          </div>
-
-                          <div style={{ color: "#444", marginTop: 2 }}>
-                            {m.lat.toFixed(5)}, {m.lng.toFixed(5)}
-                            {m.raw?.status !== undefined ? <span style={{ color: "#666" }}> • status: {m.raw.status}</span> : null}
-                            {m.raw?.mode !== undefined ? <span style={{ color: "#666" }}> • mode: {m.raw.mode}</span> : null}
-                            {m.raw?.class ? <span style={{ color: "#666" }}> • class: {m.raw.class}</span> : null}
-                          </div>
-
-                          {m.subject ? (
-                            <div style={{ color: "#777", marginTop: 2 }}>
-                              subject: {m.subject}
-                            </div>
-                          ) : null}
-                        </div>
-                      ))
-                    )}
-                  </div>
+                  />
                 </div>
+              ) : (
+                <div style={{ padding: 14, color: "#555", fontSize: 14 }}>
+                  Login on the right panel to enable enterprise activity logging.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
 
-                {activePair ? (
-                  <div style={{ marginTop: 10, padding: 8, border: "1px solid #ddd", borderRadius: 6 }}>
-                    <div>
-                      <strong>Paired:</strong> {activePair.vehicle}
+        <div
+          style={{
+            flex: 1,
+            minWidth: 0,
+            minHeight: 0,
+            display: "flex",
+            flexDirection: "column",
+            gap: 12
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              background: "#ffffff",
+              border: "1px solid #d6decf",
+              borderRadius: 14,
+              padding: "12px 16px",
+              boxShadow: "0 8px 22px rgba(0,0,0,0.08)"
+            }}
+          >
+            <div>
+              <div style={{ fontSize: 26, fontWeight: 800, color: "#1a2517" }}>MetaAg</div>
+              <div style={{ fontSize: 13, color: "#52614a" }}>Tablet layout with live machine and field status</div>
+            </div>
+            <div style={{ fontSize: 13, color: "#52614a", textAlign: "right" }}>
+              <div><strong>Mode:</strong> {mode}</div>
+              <div><strong>Field:</strong> {activeFieldLabel || "Outside all fields"}</div>
+            </div>
+          </div>
+
+          <div
+            style={{
+              position: "relative",
+              flex: 1,
+              minHeight: 0,
+              background: "#ffffff",
+              border: "1px solid #d6decf",
+              borderRadius: 14,
+              overflow: "hidden",
+              boxShadow: "0 8px 22px rgba(0,0,0,0.08)"
+            }}
+          >
+            <LoadScript googleMapsApiKey={process.env.REACT_APP_GOOGLE_MAPS_API_KEY}>
+              <GoogleMap mapContainerStyle={containerStyle} center={position || pairedLivePoint || defaultCenter} zoom={17}>
+                {polygonPaths.map((path, i) => (
+                  <Polygon
+                    key={i}
+                    paths={path}
+                    options={{
+                      strokeColor: "#e0b700",
+                      fillColor: "#f8ef9d",
+                      strokeWeight: 3,
+                      fillOpacity: 0.14
+                    }}
+                  />
+                ))}
+
+                {position && <Marker position={position} icon={makePinIcon("#1e88e5")} title="Browser / device GPS" />}
+
+                {phoneTrail.map((pt, idx) => (
+                  <Marker
+                    key={`phonept_${idx}`}
+                    position={pt}
+                    icon={makeCircleIcon("#1e88e5", 2)}
+                    clickable={false}
+                  />
+                ))}
+
+                {Object.entries(machineTrails).map(([vehicle, pts]) =>
+                  pts.map((pt, idx) => {
+                    const inside = pointIsInsideField(pt);
+                    return (
+                      <Marker
+                        key={`mpt_${vehicle}_${idx}`}
+                        position={pt}
+                        icon={makeCircleIcon(inside ? "#d62828" : "#ffffff", 3, inside ? "#ffffff" : "#555555")}
+                        clickable={false}
+                      />
+                    );
+                  })
+                )}
+
+                {latestMachinePoints.map(({ vehicle, point }) => {
+                  const isPaired = pairedVehicle && vehicle === pairedVehicle;
+                  return (
+                    <Marker
+                      key={`mlive_${vehicle}`}
+                      position={point}
+                      icon={makeTractorIcon()}
+                      title={isPaired ? `Paired: ${vehicle}` : `Seen: ${vehicle}`}
+                    />
+                  );
+                })}
+
+                {phoneTrail.length > 1 && (
+                  <Polyline
+                    path={phoneTrail}
+                    options={{
+                      strokeColor: "#1e88e5",
+                      strokeOpacity: 0.9,
+                      strokeWeight: 3
+                    }}
+                  />
+                )}
+
+                {pairedTrail.length > 1 && (
+                  <Polyline
+                    path={pairedTrail}
+                    options={{
+                      strokeColor: "#d62828",
+                      strokeOpacity: 0.95,
+                      strokeWeight: 3
+                    }}
+                  />
+                )}
+              </GoogleMap>
+            </LoadScript>
+
+            <div
+              style={{
+                position: "absolute",
+                left: 12,
+                bottom: 12,
+                background: "rgba(255,255,255,0.95)",
+                borderRadius: 12,
+                padding: "10px 12px",
+                boxShadow: "0 4px 12px rgba(0,0,0,0.18)",
+                fontSize: 12,
+                lineHeight: 1.4,
+                maxWidth: 260
+              }}
+            >
+              <div style={{ fontWeight: 700, marginBottom: 6 }}>Map legend</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                <span style={{ width: 12, height: 12, borderRadius: 999, background: "#f8ef9d", border: "2px solid #e0b700", display: "inline-block" }} />
+                <span>Field boundary</span>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                <span style={{ width: 12, height: 12, borderRadius: 999, background: "#d62828", display: "inline-block" }} />
+                <span>Point inside field</span>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                <span style={{ width: 12, height: 12, borderRadius: 999, background: "#ffffff", border: "1px solid #555", display: "inline-block" }} />
+                <span>Point outside field</span>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ fontSize: 18, lineHeight: 1 }}>🚜</span>
+                <span>Latest machine marker</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div
+          style={{
+            width: "28%",
+            minWidth: 320,
+            maxWidth: 420,
+            display: "flex",
+            flexDirection: "column",
+            gap: 12,
+            minHeight: 0
+          }}
+        >
+          <div
+            style={{
+              background: "#ffffff",
+              border: "1px solid #d6decf",
+              borderRadius: 14,
+              padding: 16,
+              boxShadow: "0 8px 22px rgba(0,0,0,0.08)",
+              overflow: "auto"
+            }}
+          >
+            <div style={{ fontSize: 28, fontWeight: 800, marginBottom: 12 }}>MetaAg</div>
+
+            <div style={{ display: "grid", gap: 10, fontSize: 15 }}>
+              <div>
+                <strong>Status:</strong>{" "}
+                <span style={{ color: statusTone, fontWeight: 700 }}>{natsStatus}</span>
+                {natsError ? <div style={{ color: "#b00020", marginTop: 4 }}>{natsError}</div> : null}
+              </div>
+              <div><strong>Machine:</strong> {currentMachineName}</div>
+              <div>
+                <strong>Location:</strong>{" "}
+                {position
+                  ? `${position.lat.toFixed(5)}, ${position.lng.toFixed(5)}`
+                  : gpsFeed[0]
+                    ? `${gpsFeed[0].lat.toFixed(5)}, ${gpsFeed[0].lng.toFixed(5)}`
+                    : "Waiting for GPS..."}
+              </div>
+              <div><strong>NATS subject:</strong> {natsUsingSubject}</div>
+              <div><strong>Messages seen:</strong> {natsMsgCount}</div>
+              {natsLastMsgAt ? <div><strong>Last msg at:</strong> {new Date(natsLastMsgAt).toLocaleTimeString()}</div> : null}
+              {natsLastSubject ? <div><strong>Last subject:</strong> {natsLastSubject}</div> : null}
+              <div><strong>Machines seen:</strong> {machinesSeen.length}</div>
+              {currentPolygon ? (
+                <div>
+                  <strong>Inside:</strong> {currentPolygon}
+                  <br />
+                  <strong>Entry Time:</strong> {entryTime ? new Date(entryTime).toLocaleTimeString() : ""}
+                </div>
+              ) : exitTime ? (
+                <div>
+                  <strong>Exited:</strong> {new Date(exitTime).toLocaleTimeString()}
+                </div>
+              ) : null}
+            </div>
+
+            <div style={{ marginTop: 14 }}>
+              <label style={{ fontWeight: 700, fontSize: 14 }}>
+                Mode:{" "}
+                <select value={mode} onChange={(e) => setMode(e.target.value)} style={{ marginLeft: 6 }}>
+                  <option value="personal">Personal</option>
+                  <option value="enterprise">Enterprise</option>
+                </select>
+              </label>
+            </div>
+
+            {mode === "enterprise" && (
+              <div style={{ marginTop: 14 }}>
+                {isEnterpriseAuthed ? (
+                  <div style={{ fontSize: 14 }}>
+                    <div><strong>User:</strong> {userName}</div>
+                    <div style={{ marginTop: 8 }}>
+                      <strong>My GPS:</strong>{" "}
+                      {position ? `${position.lat.toFixed(5)}, ${position.lng.toFixed(5)}` : "Locating..."}
                     </div>
-                    <button type="button" onClick={clearPairing} style={{ marginTop: 6, width: "100%" }}>
-                      Change / Clear pairing
+
+                    {activePair ? (
+                      <div style={{ marginTop: 10, padding: 10, border: "1px solid #ddd", borderRadius: 8 }}>
+                        <div><strong>Paired:</strong> {activePair.vehicle}</div>
+                        <button type="button" onClick={clearPairing} style={{ marginTop: 8, width: "100%" }}>
+                          Change / Clear pairing
+                        </button>
+                      </div>
+                    ) : (
+                      <div style={{ marginTop: 10, fontSize: 12, color: "#555" }}>
+                        Pairing will be requested when your phone and a machine are in the same field.
+                      </div>
+                    )}
+
+                    <button type="button" onClick={handleLogout} style={{ marginTop: 12, width: "100%" }}>
+                      Logout
                     </button>
                   </div>
                 ) : (
-                  <div style={{ marginTop: 10, fontSize: 12, color: "#555" }}>
-                    Pairing will be requested when your phone and a machine are in the same field.
+                  <div style={{ fontSize: 14 }}>
+                    <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.5rem" }}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAuthTab("login");
+                          setAuthError("");
+                        }}
+                        style={{
+                          flex: 1,
+                          background: authTab === "login" ? "#007bff" : "#e9ecef",
+                          color: authTab === "login" ? "white" : "black",
+                          border: "none",
+                          padding: "0.5rem",
+                          borderRadius: "6px",
+                          cursor: "pointer"
+                        }}
+                      >
+                        Login
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAuthTab("register");
+                          setAuthError("");
+                        }}
+                        style={{
+                          flex: 1,
+                          background: authTab === "register" ? "#007bff" : "#e9ecef",
+                          color: authTab === "register" ? "white" : "black",
+                          border: "none",
+                          padding: "0.5rem",
+                          borderRadius: "6px",
+                          cursor: "pointer"
+                        }}
+                      >
+                        Register
+                      </button>
+                    </div>
+
+                    <input
+                      type="text"
+                      value={authName}
+                      onChange={(e) => setAuthName(e.target.value)}
+                      placeholder="Name"
+                      style={{ width: "100%", padding: "0.5rem", marginBottom: "0.5rem", fontSize: "16px", boxSizing: "border-box" }}
+                    />
+                    <input
+                      type="password"
+                      value={authPasskey}
+                      onChange={(e) => setAuthPasskey(e.target.value)}
+                      placeholder="Passkey"
+                      style={{ width: "100%", padding: "0.5rem", marginBottom: "0.5rem", fontSize: "16px", boxSizing: "border-box" }}
+                    />
+
+                    {authError ? <div style={{ color: "#b00020", marginBottom: "0.5rem" }}>{authError}</div> : null}
+
+                    {authTab === "login" ? (
+                      <button type="button" onClick={handleLogin} disabled={authBusy} style={{ width: "100%", fontSize: "16px" }}>
+                        {authBusy ? "Logging in..." : "Login"}
+                      </button>
+                    ) : (
+                      <button type="button" onClick={handleRegister} disabled={authBusy} style={{ width: "100%", fontSize: "16px" }}>
+                        {authBusy ? "Registering..." : "Register"}
+                      </button>
+                    )}
+
+                    <div style={{ marginTop: "0.5rem", color: "#555" }}>
+                      {authTab === "register"
+                        ? "Registers only on this browser (localStorage)."
+                        : "Login to start tracking phone GPS + machine GPS from NATS."}
+                    </div>
                   </div>
                 )}
-
-                <button type="button" onClick={handleLogout} style={{ marginTop: "0.75rem", width: "100%" }}>
-                  Logout
-                </button>
-              </div>
-            ) : (
-              <div style={{ fontSize: "14px" }}>
-                <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.5rem" }}>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAuthTab("login");
-                      setAuthError("");
-                    }}
-                    style={{
-                      flex: 1,
-                      background: authTab === "login" ? "#007bff" : "#e9ecef",
-                      color: authTab === "login" ? "white" : "black",
-                      border: "none",
-                      padding: "0.5rem",
-                      borderRadius: "6px",
-                      cursor: "pointer"
-                    }}
-                  >
-                    Login
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAuthTab("register");
-                      setAuthError("");
-                    }}
-                    style={{
-                      flex: 1,
-                      background: authTab === "register" ? "#007bff" : "#e9ecef",
-                      color: authTab === "register" ? "white" : "black",
-                      border: "none",
-                      padding: "0.5rem",
-                      borderRadius: "6px",
-                      cursor: "pointer"
-                    }}
-                  >
-                    Register
-                  </button>
-                </div>
-
-                <input
-                  type="text"
-                  value={authName}
-                  onChange={(e) => setAuthName(e.target.value)}
-                  placeholder="Name"
-                  style={{ width: "100%", padding: "0.5rem", marginBottom: "0.5rem", fontSize: "16px" }}
-                />
-                <input
-                  type="password"
-                  value={authPasskey}
-                  onChange={(e) => setAuthPasskey(e.target.value)}
-                  placeholder="Passkey"
-                  style={{ width: "100%", padding: "0.5rem", marginBottom: "0.5rem", fontSize: "16px" }}
-                />
-
-                {authError ? <div style={{ color: "#b00020", marginBottom: "0.5rem" }}>{authError}</div> : null}
-
-                {authTab === "login" ? (
-                  <button type="button" onClick={handleLogin} disabled={authBusy} style={{ width: "100%", fontSize: "16px" }}>
-                    {authBusy ? "Logging in..." : "Login"}
-                  </button>
-                ) : (
-                  <button type="button" onClick={handleRegister} disabled={authBusy} style={{ width: "100%", fontSize: "16px" }}>
-                    {authBusy ? "Registering..." : "Register"}
-                  </button>
-                )}
-
-                <div style={{ marginTop: "0.5rem", color: "#555" }}>
-                  {authTab === "register"
-                    ? "Registers only on this browser (localStorage)."
-                    : "Login to start tracking phone GPS + machine GPS from NATS."}
-                </div>
               </div>
             )}
-          </div>
-        )}
 
-        {currentPolygon ? (
-          <div>
-            <strong>Inside:</strong> {currentPolygon}
-            <br />
-            <strong>Entry Time:</strong> {entryTime ? new Date(entryTime).toLocaleTimeString() : ""}
+            {mode === "enterprise" && isEnterpriseAuthed ? (
+              <div style={{ marginTop: "1rem" }}>
+                <div style={{ fontSize: 13, marginBottom: 6 }}>
+                  <strong>Pending records:</strong> {pendingRecords.length}
+                </div>
+                <button type="button" onClick={handleSendRecords} style={{ width: "100%", fontSize: 16 }}>
+                  Send records to NATS
+                </button>
+                {lastSendInfo ? <div style={{ marginTop: 6, fontSize: 12, color: "#555" }}>{lastSendInfo}</div> : null}
+                <button
+                  type="button"
+                  onClick={() => alert(JSON.stringify(pendingRecords, null, 2))}
+                  style={{ width: "100%", marginTop: 6 }}
+                >
+                  Preview pending records (JSON)
+                </button>
+              </div>
+            ) : null}
           </div>
-        ) : exitTime ? (
-          <div>
-            <strong>Exited:</strong> {new Date(exitTime).toLocaleTimeString()}
-            <br />
-            <strong>Location:</strong>
-            <br />
-            {position ? `${position.lat.toFixed(5)}, ${position.lng.toFixed(5)}` : "Locating..."}
-          </div>
-        ) : null}
 
-        {mode === "enterprise" && isEnterpriseAuthed ? (
-          <div style={{ marginTop: "1rem" }}>
-            <div style={{ fontSize: 13, marginBottom: 6 }}>
-              <strong>Pending records:</strong> {pendingRecords.length}
-            </div>
-            <button type="button" onClick={handleSendRecords} style={{ width: "100%", fontSize: 16 }}>
-              Send records to NATS
-            </button>
-            {lastSendInfo ? <div style={{ marginTop: 6, fontSize: 12, color: "#555" }}>{lastSendInfo}</div> : null}
-            <button
-              type="button"
-              onClick={() => alert(JSON.stringify(pendingRecords, null, 2))}
-              style={{ width: "100%", marginTop: 6 }}
+          <div
+            style={{
+              background: "#ffffff",
+              border: "1px solid #d6decf",
+              borderRadius: 14,
+              padding: 14,
+              boxShadow: "0 8px 22px rgba(0,0,0,0.08)",
+              overflow: "auto",
+              minHeight: 0
+            }}
+          >
+            <div style={{ fontWeight: 700, marginBottom: 8 }}>Live GPS messages ({gpsFeed.length})</div>
+            <div
+              style={{
+                border: "1px solid #ddd",
+                borderRadius: 10,
+                padding: 8,
+                maxHeight: 190,
+                overflow: "auto",
+                background: "rgba(255,255,255,0.7)",
+                fontSize: 12
+              }}
             >
-              Preview pending records (JSON)
-            </button>
+              {gpsFeed.length === 0 ? (
+                <div style={{ color: "#666" }}>Waiting for messages…</div>
+              ) : (
+                gpsFeed.map((m) => (
+                  <div key={m.id} style={{ padding: "6px 0", borderBottom: "1px dashed #e5e5e5" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                      <div>
+                        <strong>{m.vehicle}</strong>{" "}
+                        <span style={{ color: "#666" }}>{new Date(m.ts).toLocaleTimeString()}</span>
+                      </div>
+                      <div style={{ fontWeight: 700 }}>
+                        {m.field ? (
+                          <span style={{ color: "#0a7" }}>IN: {m.field}</span>
+                        ) : (
+                          <span style={{ color: "#b00" }}>OUTSIDE</span>
+                        )}
+                      </div>
+                    </div>
+                    <div style={{ color: "#444", marginTop: 2 }}>
+                      {m.lat.toFixed(5)}, {m.lng.toFixed(5)}
+                      {m.raw?.status !== undefined ? <span style={{ color: "#666" }}> • status: {m.raw.status}</span> : null}
+                      {m.raw?.mode !== undefined ? <span style={{ color: "#666" }}> • mode: {m.raw.mode}</span> : null}
+                      {m.raw?.class ? <span style={{ color: "#666" }}> • class: {m.raw.class}</span> : null}
+                    </div>
+                    {m.subject ? <div style={{ color: "#777", marginTop: 2 }}>subject: {m.subject}</div> : null}
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div style={{ marginTop: 12, padding: 10, border: "1px solid #ddd", borderRadius: 10 }}>
+              <div style={{ fontWeight: 700, marginBottom: 4 }}>NATS Debug</div>
+              <div style={{ fontSize: 12 }}>
+                <div><strong>Sub status:</strong> {natsSubStatus}</div>
+                <div><strong>Subject:</strong> {natsUsingSubject}</div>
+                <div><strong>Msgs seen:</strong> {natsMsgCount}</div>
+                {natsLastMsgPreview ? (
+                  <div style={{ marginTop: 4 }}>
+                    <strong>Last preview:</strong>
+                    <div style={{ whiteSpace: "pre-wrap", color: "#555" }}>{natsLastMsgPreview}</div>
+                  </div>
+                ) : null}
+              </div>
+            </div>
           </div>
-        ) : null}
+        </div>
       </div>
 
-      {/* Pairing prompt (in-app confirmation UI) */}
       {pairPrompt ? (
         <div
           style={{
             position: "absolute",
-            left: 10,
-            bottom: 10,
-            background: "rgba(255, 255, 255, 0.95)",
+            left: "50%",
+            top: 18,
+            transform: "translateX(-50%)",
+            background: "rgba(255, 255, 255, 0.97)",
             padding: "1rem",
-            borderRadius: "10px",
-            boxShadow: "0 2px 10px rgba(0,0,0,0.25)",
+            borderRadius: "12px",
+            boxShadow: "0 6px 18px rgba(0,0,0,0.25)",
             zIndex: 1100,
-            maxWidth: 420
+            maxWidth: 440,
+            width: "calc(100% - 32px)"
           }}
         >
           <div style={{ fontWeight: 700, marginBottom: 6 }}>Confirm machine</div>
@@ -1240,21 +1417,6 @@ function App() {
           </div>
         </div>
       ) : null}
-
-      {/* Chatbots */}
-      {mode === "personal" ? <Chatbot key={`cb_${chatbotResetKey}`} apiKey={process.env.REACT_APP_OPENAI_API_KEY} /> : null}
-
-      {mode === "enterprise" && isEnterpriseAuthed ? (
-        <EnterpriseChatbotRAG
-          key={`ecb_${chatbotResetKey}`}
-          userId={userId}
-          userName={userName}
-          onOperationFinalized={(payload) => {
-            console.log("Enterprise operation finalized:", payload);
-          }}
-        />
-      ) : null}
-    
     </div>
   );
 }
