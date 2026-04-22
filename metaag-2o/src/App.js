@@ -115,6 +115,17 @@ function App() {
   const [natsLastMsgPreview, setNatsLastMsgPreview] = useState("");
   const [natsUsingSubject, setNatsUsingSubject] = useState(FORCE_GPS_SUBJECT);
 
+  const appShellRef = useRef(null);
+  const resizeStateRef = useRef(null);
+  const [viewportWidth, setViewportWidth] = useState(() =>
+    typeof window !== "undefined" ? window.innerWidth : 1400
+  );
+  const [leftPanelWidth, setLeftPanelWidth] = useState(360);
+  const [rightPanelWidth, setRightPanelWidth] = useState(360);
+  const [isDebugOpen, setIsDebugOpen] = useState(false);
+  const [isChatbotOpen, setIsChatbotOpen] = useState(false);
+
+
   // Refs to avoid stale closures inside timers
   const userNameRef = useRef(userName);
   const activePairRef = useRef(activePair);
@@ -769,6 +780,7 @@ function App() {
     ? `Hey there, I see you did work in field ${activeFieldLabel}.`
     : "Chatbot prompt will appear when a field visit is detected.";
 
+
   // --- Marker icons (Google Maps) ---
   const makeCircleIcon = (fillColor, scale = 5, strokeColor = "#ffffff") => {
     const g = window.google;
@@ -835,473 +847,326 @@ function App() {
     };
   };
 
+
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  const isPortrait = viewportWidth < 1100;
+  const chatbotPanelHeight = isChatbotOpen ? (isPortrait ? 360 : 420) : 0;
+
+  const clampPanelWidth = (value, side) => {
+    const shellWidth = appShellRef.current?.getBoundingClientRect?.().width || viewportWidth || 1400;
+    const handleSpace = 28;
+    const minCenterWidth = isPortrait ? 0 : 360;
+    const minSideWidth = 260;
+    const maxByScreen = Math.max(320, shellWidth * 0.42);
+
+    if (side === "left") {
+      const other = rightPanelWidth;
+      const maxLeft = Math.max(minSideWidth, shellWidth - other - minCenterWidth - handleSpace);
+      return Math.max(minSideWidth, Math.min(value, Math.min(maxLeft, maxByScreen)));
+    }
+
+    const other = leftPanelWidth;
+    const maxRight = Math.max(minSideWidth, shellWidth - other - minCenterWidth - handleSpace);
+    return Math.max(minSideWidth, Math.min(value, Math.min(maxRight, maxByScreen)));
+  };
+
+  const startResize = (side, clientX) => {
+    if (isPortrait) return;
+    resizeStateRef.current = { side, clientX };
+  };
+
+  useEffect(() => {
+    const getClientX = (evt) => {
+      if (evt.touches?.length) return evt.touches[0].clientX;
+      if (evt.changedTouches?.length) return evt.changedTouches[0].clientX;
+      return evt.clientX;
+    };
+
+    const onMove = (evt) => {
+      const state = resizeStateRef.current;
+      if (!state || isPortrait) return;
+
+      const shellRect = appShellRef.current?.getBoundingClientRect?.();
+      if (!shellRect) return;
+
+      const clientX = getClientX(evt);
+      if (typeof clientX !== "number") return;
+
+      if (evt.cancelable) evt.preventDefault();
+
+      if (state.side === "left") {
+        const next = clampPanelWidth(clientX - shellRect.left, "left");
+        setLeftPanelWidth(next);
+      } else if (state.side === "right") {
+        const next = clampPanelWidth(shellRect.right - clientX, "right");
+        setRightPanelWidth(next);
+      }
+    };
+
+    const onUp = () => {
+      resizeStateRef.current = null;
+    };
+
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    window.addEventListener("touchmove", onMove, { passive: false });
+    window.addEventListener("touchend", onUp);
+
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("touchmove", onMove);
+      window.removeEventListener("touchend", onUp);
+    };
+  }, [isPortrait, leftPanelWidth, rightPanelWidth, viewportWidth]);
+
   const pointIsInsideField = (pt) => {
     if (!pt) return false;
     return !!checkInsidePolygon([pt.lng, pt.lat], polygons);
   };
 
-  // Map shortcut
-  if (window.location.hash === "#map") return <FieldMap />;
+  const splitHandleStyle = {
+    width: 14,
+    borderRadius: 10,
+    background: "transparent",
+    position: "relative",
+    cursor: "col-resize",
+    touchAction: "none",
+    alignSelf: "stretch"
+  };
 
-  return (
-    <div
-      style={{
-        width: "100%",
-        height: "100vh",
-        background: "#eef3e8",
-        overflow: "hidden",
-        position: "relative"
-      }}
-    >
+  const splitHandleInnerStyle = {
+    position: "absolute",
+    left: "50%",
+    top: 10,
+    bottom: 10,
+    width: 4,
+    transform: "translateX(-50%)",
+    borderRadius: 999,
+    background: "rgba(31, 77, 44, 0.18)"
+  };
+
+  const infoPanelContent = (
+    <>
       <div
         style={{
-          display: "flex",
-          gap: 14,
-          width: "100%",
-          height: "100%",
-          padding: 14,
-          boxSizing: "border-box"
+          background: "#ffffff",
+          border: "1px solid #d6decf",
+          borderRadius: 14,
+          padding: 16,
+          boxShadow: "0 8px 22px rgba(0,0,0,0.08)",
+          overflow: "auto"
         }}
       >
-        <div
-          style={{
-            width: "26%",
-            minWidth: 290,
-            maxWidth: 380,
-            display: "flex",
-            flexDirection: "column",
-            gap: 12,
-            minHeight: 0
-          }}
-        >
-          <div
-            style={{
-              background: "#ffffff",
-              border: "1px solid #d6decf",
-              borderRadius: 14,
-              padding: 14,
-              boxShadow: "0 8px 22px rgba(0,0,0,0.08)"
-            }}
-          >
-            <div style={{ fontSize: 12, fontWeight: 700, color: "#4e5b47", textTransform: "uppercase", letterSpacing: 0.5 }}>
-              Activity prompt
-            </div>
-            <div style={{ marginTop: 8, fontSize: 18, fontWeight: 600, lineHeight: 1.35 }}>{chatbotPromptText}</div>
-            <button
-              type="button"
-              onClick={() => alert("Use the chatbot panel below to log activity.")}
-              style={{
-                marginTop: 12,
-                width: "100%",
-                padding: "12px 14px",
-                borderRadius: 10,
-                border: "1px solid #1f4d2c",
-                background: "#1f4d2c",
-                color: "#fff",
-                fontWeight: 700,
-                cursor: "pointer"
-              }}
-            >
-              Log Activity
-            </button>
-          </div>
+        <div style={{ fontSize: 28, fontWeight: 800, marginBottom: 12 }}>MetaAg</div>
 
-          <div
-            style={{
-              position: "relative",
-              flex: 1,
-              minHeight: 0,
-              overflow: "hidden",
-              background: "#ffffff",
-              border: "1px solid #d6decf",
-              borderRadius: 14,
-              boxShadow: "0 8px 22px rgba(0,0,0,0.08)"
-            }}
-          >
-            <div style={{ padding: "12px 14px 0", fontWeight: 700, color: "#243120" }}>Assistant</div>
-            <div style={{ position: "relative", height: "calc(100% - 40px)", minHeight: 340 }}>
-              {mode === "personal" ? (
-                <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
-                  <div style={{ position: "absolute", inset: 0, background: "#fff" }} />
-                  <Chatbot key={`cb_${chatbotResetKey}`} apiKey={process.env.REACT_APP_OPENAI_API_KEY} />
-                </div>
-              ) : mode === "enterprise" && isEnterpriseAuthed ? (
-                <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
-                  <EnterpriseChatbotRAG
-                    key={`ecb_${chatbotResetKey}`}
-                    userId={userId}
-                    userName={userName}
-                    onOperationFinalized={(payload) => {
-                      console.log("Enterprise operation finalized:", payload);
-                    }}
-                  />
-                </div>
-              ) : (
-                <div style={{ padding: 14, color: "#555", fontSize: 14 }}>
-                  Login on the right panel to enable enterprise activity logging.
-                </div>
-              )}
-            </div>
+        <div style={{ display: "grid", gap: 10, fontSize: 15 }}>
+          <div>
+            <strong>Status:</strong>{" "}
+            <span style={{ color: statusTone, fontWeight: 700 }}>{natsStatus}</span>
+            {natsError ? <div style={{ color: "#b00020", marginTop: 4 }}>{natsError}</div> : null}
           </div>
-        </div>
-
-        <div
-          style={{
-            flex: 1,
-            minWidth: 0,
-            minHeight: 0,
-            display: "flex",
-            flexDirection: "column",
-            gap: 12
-          }}
-        >
-          <div
-            style={{
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              background: "#ffffff",
-              border: "1px solid #d6decf",
-              borderRadius: 14,
-              padding: "12px 16px",
-              boxShadow: "0 8px 22px rgba(0,0,0,0.08)"
-            }}
-          >
+          <div><strong>Machine:</strong> {currentMachineName}</div>
+          <div>
+            <strong>Location:</strong>{" "}
+            {position
+              ? `${position.lat.toFixed(5)}, ${position.lng.toFixed(5)}`
+              : gpsFeed[0]
+                ? `${gpsFeed[0].lat.toFixed(5)}, ${gpsFeed[0].lng.toFixed(5)}`
+                : "Waiting for GPS..."}
+          </div>
+          <div><strong>NATS subject:</strong> {natsUsingSubject}</div>
+          <div><strong>Messages seen:</strong> {natsMsgCount}</div>
+          {natsLastMsgAt ? <div><strong>Last msg at:</strong> {new Date(natsLastMsgAt).toLocaleTimeString()}</div> : null}
+          {natsLastSubject ? <div><strong>Last subject:</strong> {natsLastSubject}</div> : null}
+          <div><strong>Machines seen:</strong> {machinesSeen.length}</div>
+          <div><strong>Field:</strong> {activeFieldLabel || "Outside all fields"}</div>
+          {currentPolygon ? (
             <div>
-              <div style={{ fontSize: 26, fontWeight: 800, color: "#1a2517" }}>MetaAg</div>
-              <div style={{ fontSize: 13, color: "#52614a" }}>Tablet layout with live machine and field status</div>
+              <strong>Inside:</strong> {currentPolygon}
+              <br />
+              <strong>Entry Time:</strong> {entryTime ? new Date(entryTime).toLocaleTimeString() : ""}
             </div>
-            <div style={{ fontSize: 13, color: "#52614a", textAlign: "right" }}>
-              <div><strong>Mode:</strong> {mode}</div>
-              <div><strong>Field:</strong> {activeFieldLabel || "Outside all fields"}</div>
+          ) : exitTime ? (
+            <div>
+              <strong>Exited:</strong> {new Date(exitTime).toLocaleTimeString()}
             </div>
-          </div>
-
-          <div
-            style={{
-              position: "relative",
-              flex: 1,
-              minHeight: 0,
-              background: "#ffffff",
-              border: "1px solid #d6decf",
-              borderRadius: 14,
-              overflow: "hidden",
-              boxShadow: "0 8px 22px rgba(0,0,0,0.08)"
-            }}
-          >
-            <LoadScript googleMapsApiKey={process.env.REACT_APP_GOOGLE_MAPS_API_KEY}>
-              <GoogleMap mapContainerStyle={containerStyle} center={position || pairedLivePoint || defaultCenter} zoom={17}>
-                {polygonPaths.map((path, i) => (
-                  <Polygon
-                    key={i}
-                    paths={path}
-                    options={{
-                      strokeColor: "#e0b700",
-                      fillColor: "#f8ef9d",
-                      strokeWeight: 3,
-                      fillOpacity: 0.14
-                    }}
-                  />
-                ))}
-
-                {position && <Marker position={position} icon={makePinIcon("#1e88e5")} title="Browser / device GPS" />}
-
-                {phoneTrail.map((pt, idx) => (
-                  <Marker
-                    key={`phonept_${idx}`}
-                    position={pt}
-                    icon={makeCircleIcon("#1e88e5", 2)}
-                    clickable={false}
-                  />
-                ))}
-
-                {Object.entries(machineTrails).map(([vehicle, pts]) =>
-                  pts.map((pt, idx) => {
-                    const inside = pointIsInsideField(pt);
-                    return (
-                      <Marker
-                        key={`mpt_${vehicle}_${idx}`}
-                        position={pt}
-                        icon={makeCircleIcon(inside ? "#d62828" : "#ffffff", 3, inside ? "#ffffff" : "#555555")}
-                        clickable={false}
-                      />
-                    );
-                  })
-                )}
-
-                {latestMachinePoints.map(({ vehicle, point }) => {
-                  const isPaired = pairedVehicle && vehicle === pairedVehicle;
-                  return (
-                    <Marker
-                      key={`mlive_${vehicle}`}
-                      position={point}
-                      icon={makeTractorIcon()}
-                      title={isPaired ? `Paired: ${vehicle}` : `Seen: ${vehicle}`}
-                    />
-                  );
-                })}
-
-                {phoneTrail.length > 1 && (
-                  <Polyline
-                    path={phoneTrail}
-                    options={{
-                      strokeColor: "#1e88e5",
-                      strokeOpacity: 0.9,
-                      strokeWeight: 3
-                    }}
-                  />
-                )}
-
-                {pairedTrail.length > 1 && (
-                  <Polyline
-                    path={pairedTrail}
-                    options={{
-                      strokeColor: "#d62828",
-                      strokeOpacity: 0.95,
-                      strokeWeight: 3
-                    }}
-                  />
-                )}
-              </GoogleMap>
-            </LoadScript>
-
-            <div
-              style={{
-                position: "absolute",
-                left: 12,
-                bottom: 12,
-                background: "rgba(255,255,255,0.95)",
-                borderRadius: 12,
-                padding: "10px 12px",
-                boxShadow: "0 4px 12px rgba(0,0,0,0.18)",
-                fontSize: 12,
-                lineHeight: 1.4,
-                maxWidth: 260
-              }}
-            >
-              <div style={{ fontWeight: 700, marginBottom: 6 }}>Map legend</div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                <span style={{ width: 12, height: 12, borderRadius: 999, background: "#f8ef9d", border: "2px solid #e0b700", display: "inline-block" }} />
-                <span>Field boundary</span>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                <span style={{ width: 12, height: 12, borderRadius: 999, background: "#d62828", display: "inline-block" }} />
-                <span>Point inside field</span>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-                <span style={{ width: 12, height: 12, borderRadius: 999, background: "#ffffff", border: "1px solid #555", display: "inline-block" }} />
-                <span>Point outside field</span>
-              </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <span style={{ fontSize: 18, lineHeight: 1 }}>🚜</span>
-                <span>Latest machine marker</span>
-              </div>
-            </div>
-          </div>
+          ) : null}
         </div>
 
-        <div
-          style={{
-            width: "28%",
-            minWidth: 320,
-            maxWidth: 420,
-            display: "flex",
-            flexDirection: "column",
-            gap: 12,
-            minHeight: 0
-          }}
-        >
-          <div
-            style={{
-              background: "#ffffff",
-              border: "1px solid #d6decf",
-              borderRadius: 14,
-              padding: 16,
-              boxShadow: "0 8px 22px rgba(0,0,0,0.08)",
-              overflow: "auto"
-            }}
-          >
-            <div style={{ fontSize: 28, fontWeight: 800, marginBottom: 12 }}>MetaAg</div>
+        <div style={{ marginTop: 14 }}>
+          <label style={{ fontWeight: 700, fontSize: 14 }}>
+            Mode:{" "}
+            <select value={mode} onChange={(e) => setMode(e.target.value)} style={{ marginLeft: 6 }}>
+              <option value="personal">Personal</option>
+              <option value="enterprise">Enterprise</option>
+            </select>
+          </label>
+        </div>
 
-            <div style={{ display: "grid", gap: 10, fontSize: 15 }}>
-              <div>
-                <strong>Status:</strong>{" "}
-                <span style={{ color: statusTone, fontWeight: 700 }}>{natsStatus}</span>
-                {natsError ? <div style={{ color: "#b00020", marginTop: 4 }}>{natsError}</div> : null}
-              </div>
-              <div><strong>Machine:</strong> {currentMachineName}</div>
-              <div>
-                <strong>Location:</strong>{" "}
-                {position
-                  ? `${position.lat.toFixed(5)}, ${position.lng.toFixed(5)}`
-                  : gpsFeed[0]
-                    ? `${gpsFeed[0].lat.toFixed(5)}, ${gpsFeed[0].lng.toFixed(5)}`
-                    : "Waiting for GPS..."}
-              </div>
-              <div><strong>NATS subject:</strong> {natsUsingSubject}</div>
-              <div><strong>Messages seen:</strong> {natsMsgCount}</div>
-              {natsLastMsgAt ? <div><strong>Last msg at:</strong> {new Date(natsLastMsgAt).toLocaleTimeString()}</div> : null}
-              {natsLastSubject ? <div><strong>Last subject:</strong> {natsLastSubject}</div> : null}
-              <div><strong>Machines seen:</strong> {machinesSeen.length}</div>
-              {currentPolygon ? (
-                <div>
-                  <strong>Inside:</strong> {currentPolygon}
-                  <br />
-                  <strong>Entry Time:</strong> {entryTime ? new Date(entryTime).toLocaleTimeString() : ""}
+        {mode === "enterprise" && (
+          <div style={{ marginTop: 14 }}>
+            {isEnterpriseAuthed ? (
+              <div style={{ fontSize: 14 }}>
+                <div><strong>User:</strong> {userName}</div>
+                <div style={{ marginTop: 8 }}>
+                  <strong>My GPS:</strong>{" "}
+                  {position ? `${position.lat.toFixed(5)}, ${position.lng.toFixed(5)}` : "Locating..."}
                 </div>
-              ) : exitTime ? (
-                <div>
-                  <strong>Exited:</strong> {new Date(exitTime).toLocaleTimeString()}
-                </div>
-              ) : null}
-            </div>
 
-            <div style={{ marginTop: 14 }}>
-              <label style={{ fontWeight: 700, fontSize: 14 }}>
-                Mode:{" "}
-                <select value={mode} onChange={(e) => setMode(e.target.value)} style={{ marginLeft: 6 }}>
-                  <option value="personal">Personal</option>
-                  <option value="enterprise">Enterprise</option>
-                </select>
-              </label>
-            </div>
-
-            {mode === "enterprise" && (
-              <div style={{ marginTop: 14 }}>
-                {isEnterpriseAuthed ? (
-                  <div style={{ fontSize: 14 }}>
-                    <div><strong>User:</strong> {userName}</div>
-                    <div style={{ marginTop: 8 }}>
-                      <strong>My GPS:</strong>{" "}
-                      {position ? `${position.lat.toFixed(5)}, ${position.lng.toFixed(5)}` : "Locating..."}
-                    </div>
-
-                    {activePair ? (
-                      <div style={{ marginTop: 10, padding: 10, border: "1px solid #ddd", borderRadius: 8 }}>
-                        <div><strong>Paired:</strong> {activePair.vehicle}</div>
-                        <button type="button" onClick={clearPairing} style={{ marginTop: 8, width: "100%" }}>
-                          Change / Clear pairing
-                        </button>
-                      </div>
-                    ) : (
-                      <div style={{ marginTop: 10, fontSize: 12, color: "#555" }}>
-                        Pairing will be requested when your phone and a machine are in the same field.
-                      </div>
-                    )}
-
-                    <button type="button" onClick={handleLogout} style={{ marginTop: 12, width: "100%" }}>
-                      Logout
+                {activePair ? (
+                  <div style={{ marginTop: 10, padding: 10, border: "1px solid #ddd", borderRadius: 8 }}>
+                    <div><strong>Paired:</strong> {activePair.vehicle}</div>
+                    <button type="button" onClick={clearPairing} style={{ marginTop: 8, width: "100%" }}>
+                      Change / Clear pairing
                     </button>
                   </div>
                 ) : (
-                  <div style={{ fontSize: 14 }}>
-                    <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.5rem" }}>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setAuthTab("login");
-                          setAuthError("");
-                        }}
-                        style={{
-                          flex: 1,
-                          background: authTab === "login" ? "#007bff" : "#e9ecef",
-                          color: authTab === "login" ? "white" : "black",
-                          border: "none",
-                          padding: "0.5rem",
-                          borderRadius: "6px",
-                          cursor: "pointer"
-                        }}
-                      >
-                        Login
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setAuthTab("register");
-                          setAuthError("");
-                        }}
-                        style={{
-                          flex: 1,
-                          background: authTab === "register" ? "#007bff" : "#e9ecef",
-                          color: authTab === "register" ? "white" : "black",
-                          border: "none",
-                          padding: "0.5rem",
-                          borderRadius: "6px",
-                          cursor: "pointer"
-                        }}
-                      >
-                        Register
-                      </button>
-                    </div>
-
-                    <input
-                      type="text"
-                      value={authName}
-                      onChange={(e) => setAuthName(e.target.value)}
-                      placeholder="Name"
-                      style={{ width: "100%", padding: "0.5rem", marginBottom: "0.5rem", fontSize: "16px", boxSizing: "border-box" }}
-                    />
-                    <input
-                      type="password"
-                      value={authPasskey}
-                      onChange={(e) => setAuthPasskey(e.target.value)}
-                      placeholder="Passkey"
-                      style={{ width: "100%", padding: "0.5rem", marginBottom: "0.5rem", fontSize: "16px", boxSizing: "border-box" }}
-                    />
-
-                    {authError ? <div style={{ color: "#b00020", marginBottom: "0.5rem" }}>{authError}</div> : null}
-
-                    {authTab === "login" ? (
-                      <button type="button" onClick={handleLogin} disabled={authBusy} style={{ width: "100%", fontSize: "16px" }}>
-                        {authBusy ? "Logging in..." : "Login"}
-                      </button>
-                    ) : (
-                      <button type="button" onClick={handleRegister} disabled={authBusy} style={{ width: "100%", fontSize: "16px" }}>
-                        {authBusy ? "Registering..." : "Register"}
-                      </button>
-                    )}
-
-                    <div style={{ marginTop: "0.5rem", color: "#555" }}>
-                      {authTab === "register"
-                        ? "Registers only on this browser (localStorage)."
-                        : "Login to start tracking phone GPS + machine GPS from NATS."}
-                    </div>
+                  <div style={{ marginTop: 10, fontSize: 12, color: "#555" }}>
+                    Pairing will be requested when your phone and a machine are in the same field.
                   </div>
                 )}
+
+                <button type="button" onClick={handleLogout} style={{ marginTop: 12, width: "100%" }}>
+                  Logout
+                </button>
+              </div>
+            ) : (
+              <div style={{ fontSize: 14 }}>
+                <div style={{ display: "flex", gap: "0.5rem", marginBottom: "0.5rem" }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAuthTab("login");
+                      setAuthError("");
+                    }}
+                    style={{
+                      flex: 1,
+                      background: authTab === "login" ? "#007bff" : "#e9ecef",
+                      color: authTab === "login" ? "white" : "black",
+                      border: "none",
+                      padding: "0.5rem",
+                      borderRadius: "6px",
+                      cursor: "pointer"
+                    }}
+                  >
+                    Login
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAuthTab("register");
+                      setAuthError("");
+                    }}
+                    style={{
+                      flex: 1,
+                      background: authTab === "register" ? "#007bff" : "#e9ecef",
+                      color: authTab === "register" ? "white" : "black",
+                      border: "none",
+                      padding: "0.5rem",
+                      borderRadius: "6px",
+                      cursor: "pointer"
+                    }}
+                  >
+                    Register
+                  </button>
+                </div>
+
+                <input
+                  type="text"
+                  value={authName}
+                  onChange={(e) => setAuthName(e.target.value)}
+                  placeholder="Name"
+                  style={{ width: "100%", padding: "0.5rem", marginBottom: "0.5rem", fontSize: "16px", boxSizing: "border-box" }}
+                />
+                <input
+                  type="password"
+                  value={authPasskey}
+                  onChange={(e) => setAuthPasskey(e.target.value)}
+                  placeholder="Passkey"
+                  style={{ width: "100%", padding: "0.5rem", marginBottom: "0.5rem", fontSize: "16px", boxSizing: "border-box" }}
+                />
+
+                {authError ? <div style={{ color: "#b00020", marginBottom: "0.5rem" }}>{authError}</div> : null}
+
+                {authTab === "login" ? (
+                  <button type="button" onClick={handleLogin} disabled={authBusy} style={{ width: "100%", fontSize: "16px" }}>
+                    {authBusy ? "Logging in..." : "Login"}
+                  </button>
+                ) : (
+                  <button type="button" onClick={handleRegister} disabled={authBusy} style={{ width: "100%", fontSize: "16px" }}>
+                    {authBusy ? "Registering..." : "Register"}
+                  </button>
+                )}
+
+                <div style={{ marginTop: "0.5rem", color: "#555" }}>
+                  {authTab === "register"
+                    ? "Registers only on this browser (localStorage)."
+                    : "Login to start tracking phone GPS + machine GPS from NATS."}
+                </div>
               </div>
             )}
-
-            {mode === "enterprise" && isEnterpriseAuthed ? (
-              <div style={{ marginTop: "1rem" }}>
-                <div style={{ fontSize: 13, marginBottom: 6 }}>
-                  <strong>Pending records:</strong> {pendingRecords.length}
-                </div>
-                <button type="button" onClick={handleSendRecords} style={{ width: "100%", fontSize: 16 }}>
-                  Send records to NATS
-                </button>
-                {lastSendInfo ? <div style={{ marginTop: 6, fontSize: 12, color: "#555" }}>{lastSendInfo}</div> : null}
-                <button
-                  type="button"
-                  onClick={() => alert(JSON.stringify(pendingRecords, null, 2))}
-                  style={{ width: "100%", marginTop: 6 }}
-                >
-                  Preview pending records (JSON)
-                </button>
-              </div>
-            ) : null}
           </div>
+        )}
 
-          <div
-            style={{
-              background: "#ffffff",
-              border: "1px solid #d6decf",
-              borderRadius: 14,
-              padding: 14,
-              boxShadow: "0 8px 22px rgba(0,0,0,0.08)",
-              overflow: "auto",
-              minHeight: 0
-            }}
-          >
+        {mode === "enterprise" && isEnterpriseAuthed ? (
+          <div style={{ marginTop: "1rem" }}>
+            <div style={{ fontSize: 13, marginBottom: 6 }}>
+              <strong>Pending records:</strong> {pendingRecords.length}
+            </div>
+            <button type="button" onClick={handleSendRecords} style={{ width: "100%", fontSize: 16 }}>
+              Send records to NATS
+            </button>
+            {lastSendInfo ? <div style={{ marginTop: 6, fontSize: 12, color: "#555" }}>{lastSendInfo}</div> : null}
+            <button
+              type="button"
+              onClick={() => alert(JSON.stringify(pendingRecords, null, 2))}
+              style={{ width: "100%", marginTop: 6 }}
+            >
+              Preview pending records (JSON)
+            </button>
+          </div>
+        ) : null}
+      </div>
+
+      <div
+        style={{
+          background: "#ffffff",
+          border: "1px solid #d6decf",
+          borderRadius: 14,
+          boxShadow: "0 8px 22px rgba(0,0,0,0.08)",
+          overflow: "hidden",
+          minHeight: 0
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => setIsDebugOpen((v) => !v)}
+          style={{
+            width: "100%",
+            textAlign: "left",
+            border: "none",
+            background: "#ffffff",
+            padding: 14,
+            fontWeight: 700,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between"
+          }}
+        >
+          <span>Debug / Live GPS</span>
+          <span style={{ fontSize: 18, lineHeight: 1 }}>{isDebugOpen ? "–" : "+"}</span>
+        </button>
+
+        {isDebugOpen ? (
+          <div style={{ padding: "0 14px 14px", overflow: "auto" }}>
             <div style={{ fontWeight: 700, marginBottom: 8 }}>Live GPS messages ({gpsFeed.length})</div>
             <div
               style={{
@@ -1359,7 +1224,325 @@ function App() {
               </div>
             </div>
           </div>
+        ) : null}
+      </div>
+    </>
+  );
+
+  const floatingChatbotOverlay = (
+    <div
+      style={{
+        position: "absolute",
+        right: 12,
+        bottom: 12,
+        zIndex: 20,
+        width: isPortrait ? "min(calc(100% - 24px), 420px)" : Math.max(300, Math.min(rightPanelWidth, 460)),
+        maxWidth: "calc(100% - 24px)",
+        pointerEvents: "auto"
+      }}
+    >
+      {!isPortrait ? (
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize chatbot width"
+          onMouseDown={(e) => startResize("right", e.clientX)}
+          onTouchStart={(e) => startResize("right", e.touches[0].clientX)}
+          style={{
+            position: "absolute",
+            left: -14,
+            top: 0,
+            bottom: 0,
+            width: 14,
+            borderRadius: 10,
+            background: "transparent",
+            cursor: "col-resize",
+            touchAction: "none"
+          }}
+        >
+          <div
+            style={{
+              position: "absolute",
+              left: "50%",
+              top: "50%",
+              width: 4,
+              height: 44,
+              transform: "translate(-50%, -50%)",
+              borderRadius: 999,
+              background: "rgba(255,255,255,0.7)",
+              boxShadow: "0 2px 8px rgba(0,0,0,0.15)"
+            }}
+          />
         </div>
+      ) : null}
+
+      <button
+  type="button"
+  onClick={() => setIsChatbotOpen((v) => !v)}
+  style={{
+    width: "100%",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    padding: "12px 16px",
+    borderRadius: 999,
+    border: "1px solid rgba(214, 222, 207, 0.95)",
+    background: "rgba(255,255,255,0.98)",
+    boxShadow: "0 10px 24px rgba(0,0,0,0.18)",
+    backdropFilter: "blur(8px)",
+    cursor: "pointer",
+    fontWeight: 800,
+    fontSize: 16,
+    color: "#243120"
+  }}
+>
+  <span>Chatbot Assistant</span>
+  <span style={{ fontSize: 18, lineHeight: 1 }}>{isChatbotOpen ? "▾" : "▸"}</span>
+</button>
+
+{isChatbotOpen ? (
+  <div
+    style={{
+      marginTop: 8,
+      height: chatbotPanelHeight,
+      background: "rgba(255, 255, 255, 0.47)",
+      borderRadius: 18,
+      overflow: "hidden",
+      boxShadow: "0 12px 28px rgba(0,0,0,0.2)",
+      border: "1px solid rgba(214, 222, 207, 0.95)",
+      backdropFilter: "blur(8px)"
+    }}
+  >
+    {mode === "personal" ? (
+      <div style={{ height: "100%", overflow: "hidden" }}>
+        <Chatbot key={`cb_${chatbotResetKey}`} apiKey={process.env.REACT_APP_OPENAI_API_KEY} />
+      </div>
+    ) : mode === "enterprise" && isEnterpriseAuthed ? (
+      <div style={{ height: "100%", overflow: "hidden" }}>
+        <EnterpriseChatbotRAG
+          key={`ecb_${chatbotResetKey}`}
+          userId={userId}
+          userName={userName}
+          onOperationFinalized={(payload) => {
+            console.log("Enterprise operation finalized:", payload);
+          }}
+        />
+      </div>
+    ) : (
+      <div style={{ padding: 14, color: "#555", fontSize: 14 }}>
+        Login in the info panel to enable enterprise activity logging.
+      </div>
+    )}
+  </div>
+) : null}
+    </div>
+  );
+
+  const mapPanelContent = (
+    <div
+      style={{
+        position: "relative",
+        flex: 1,
+        minHeight: 0,
+        background: "#ffffff",
+        border: "1px solid #d6decf",
+        borderRadius: 14,
+        overflow: "hidden",
+        boxShadow: "0 8px 22px rgba(0,0,0,0.08)"
+      }}
+    >
+      <LoadScript googleMapsApiKey={process.env.REACT_APP_GOOGLE_MAPS_API_KEY}>
+        <GoogleMap mapContainerStyle={containerStyle} center={position || pairedLivePoint || defaultCenter} zoom={17}>
+          {polygonPaths.map((path, i) => (
+            <Polygon
+              key={i}
+              paths={path}
+              options={{
+                strokeColor: "#e0b700",
+                fillColor: "#f8ef9d",
+                strokeWeight: 3,
+                fillOpacity: 0.14
+              }}
+            />
+          ))}
+
+          {position && <Marker position={position} icon={makePinIcon("#1e88e5")} title="Browser / device GPS" />}
+
+          {phoneTrail.map((pt, idx) => (
+            <Marker
+              key={`phonept_${idx}`}
+              position={pt}
+              icon={makeCircleIcon("#1e88e5", 2)}
+              clickable={false}
+            />
+          ))}
+
+          {Object.entries(machineTrails).map(([vehicle, pts]) =>
+            pts.map((pt, idx) => {
+              const inside = pointIsInsideField(pt);
+              return (
+                <Marker
+                  key={`mpt_${vehicle}_${idx}`}
+                  position={pt}
+                  icon={makeCircleIcon(inside ? "#d62828" : "#ffffff", 3, inside ? "#ffffff" : "#555555")}
+                  clickable={false}
+                />
+              );
+            })
+          )}
+
+          {latestMachinePoints.map(({ vehicle, point }) => {
+            const isPaired = pairedVehicle && vehicle === pairedVehicle;
+            return (
+              <Marker
+                key={`mlive_${vehicle}`}
+                position={point}
+                icon={makeTractorIcon()}
+                title={isPaired ? `Paired: ${vehicle}` : `Seen: ${vehicle}`}
+              />
+            );
+          })}
+
+          {phoneTrail.length > 1 && (
+            <Polyline
+              path={phoneTrail}
+              options={{
+                strokeColor: "#1e88e5",
+                strokeOpacity: 0.9,
+                strokeWeight: 3
+              }}
+            />
+          )}
+
+          {pairedTrail.length > 1 && (
+            <Polyline
+              path={pairedTrail}
+              options={{
+                strokeColor: "#d62828",
+                strokeOpacity: 0.95,
+                strokeWeight: 3
+              }}
+            />
+          )}
+        </GoogleMap>
+      </LoadScript>
+
+      <div
+        style={{
+          position: "absolute",
+          left: 12,
+          bottom: 12,
+          background: "rgba(255,255,255,0.95)",
+          borderRadius: 12,
+          padding: "10px 12px",
+          boxShadow: "0 4px 12px rgba(0,0,0,0.18)",
+          fontSize: 12,
+          lineHeight: 1.4,
+          maxWidth: 260
+        }}
+      >
+        <div style={{ fontWeight: 700, marginBottom: 6 }}>Map legend</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          <span style={{ width: 12, height: 12, borderRadius: 999, background: "#f8ef9d", border: "2px solid #e0b700", display: "inline-block" }} />
+          <span>Field boundary</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          <span style={{ width: 12, height: 12, borderRadius: 999, background: "#d62828", display: "inline-block" }} />
+          <span>Point inside field</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+          <span style={{ width: 12, height: 12, borderRadius: 999, background: "#ffffff", border: "1px solid #555", display: "inline-block" }} />
+          <span>Point outside field</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 18, lineHeight: 1 }}>🚜</span>
+          <span>Latest machine marker</span>
+        </div>
+      </div>
+      {floatingChatbotOverlay}
+    </div>
+  );
+
+
+
+  // Map shortcut
+  if (window.location.hash === "#map") return <FieldMap />;
+
+  return (
+    <div
+      style={{
+        width: "100%",
+        height: "100vh",
+        background: "#eef3e8",
+        overflow: "hidden",
+        position: "relative"
+      }}
+    >
+      <div
+        ref={appShellRef}
+        style={{
+          width: "100%",
+          height: "100%",
+          padding: 14,
+          boxSizing: "border-box"
+        }}
+      >
+        {isPortrait ? (
+          <div
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 12,
+              width: "100%",
+              height: "100%"
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 12,
+                maxHeight: "40vh",
+                overflow: "auto"
+              }}
+            >
+              {infoPanelContent}
+            </div>
+
+            <div style={{ flex: 1, minHeight: 260, display: "flex", flexDirection: "column" }}>
+              {mapPanelContent}
+            </div>
+          </div>
+        ) : (
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: `${leftPanelWidth}px 14px minmax(0, 1fr)`,
+              gap: 0,
+              width: "100%",
+              height: "100%"
+            }}
+          >
+            <div style={{ minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", gap: 12 }}>
+              {infoPanelContent}
+            </div>
+
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize info panel"
+              onMouseDown={(e) => startResize("left", e.clientX)}
+              onTouchStart={(e) => startResize("left", e.touches[0].clientX)}
+              style={splitHandleStyle}
+            >
+              <div style={splitHandleInnerStyle} />
+            </div>
+
+            <div style={{ minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
+              {mapPanelContent}
+            </div>
+          </div>
+        )}
       </div>
 
       {pairPrompt ? (
@@ -1413,12 +1596,13 @@ function App() {
           </div>
 
           <div style={{ fontSize: 12, color: "#555", marginTop: 8 }}>
-            Tip: If you picked the wrong machine, click “Change / Clear pairing” on the right panel.
+            Tip: If you picked the wrong machine, click “Change / Clear pairing” in the info panel.
           </div>
         </div>
       ) : null}
     </div>
   );
+
 }
 
 export default App;
